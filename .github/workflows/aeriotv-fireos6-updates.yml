@@ -199,6 +199,48 @@ jobs:
           print(f'Patched Android 7.1 (API 25), java.time support, versionCode={version_code}, versionName suffix={suffix or "(none)"}.')
           PY
 
+      - name: Show What's New only for new upstream versions
+        if: steps.version.outputs.already_built == 'false' && steps.version.outputs.version_suffix != ''
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # main builds carry a -main.<sha> versionName suffix, which changes on
+          # every build. The app shows What's New whenever the stored version
+          # differs from versionName, so every daily build re-showed the same
+          # notes. Compare the upstream version only (0.5.13), and treat a stored
+          # suffixed value as the same version so existing installs stay quiet.
+          base = 'app/src/main/java/com/aeriotv/android'
+          strip = '.substringBefore("-main.")'
+          patches = {
+              f'upstream/{base}/feature/whatsnew/WhatsNewSheet.kt': [
+                  ('    val current = BuildConfig.VERSION_NAME\n',
+                   f'    val current = BuildConfig.VERSION_NAME{strip}\n'),
+                  ('} else if (seen != current) {',
+                   f'}} else if (seen{strip} != current) {{'),
+              ],
+              f'upstream/{base}/feature/update/UpdateUi.kt': [
+                  ('lastSeenWhatsNew == BuildConfig.VERSION_NAME',
+                   f'lastSeenWhatsNew?{strip} == BuildConfig.VERSION_NAME{strip}'),
+              ],
+              f'upstream/{base}/AerioTVApplication.kt': [
+                  ('seenVersion == BuildConfig.VERSION_NAME',
+                   f'seenVersion{strip} == BuildConfig.VERSION_NAME{strip}'),
+              ],
+          }
+          for name, subs in patches.items():
+              path = Path(name)
+              source = path.read_text(encoding='utf-8')
+              for old, new in subs:
+                  count = source.count(old)
+                  if count != 1:
+                      raise SystemExit(f"Upstream What's New layout changed in {name}: expected exactly one {old!r}, found {count}. Review instead of guessing.")
+                  source = source.replace(old, new, 1)
+              path.write_text(source, encoding='utf-8')
+          print("Patched What's New to compare the upstream version only.")
+          PY
+
       - name: Set up Gradle cache
         if: steps.version.outputs.already_built == 'false'
         uses: gradle/actions/setup-gradle@v4
