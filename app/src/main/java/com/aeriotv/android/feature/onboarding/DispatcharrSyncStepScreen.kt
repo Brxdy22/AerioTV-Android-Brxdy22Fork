@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -35,9 +36,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import com.aeriotv.android.core.preferences.AppPreferences
@@ -115,6 +118,8 @@ fun DispatcharrSyncStepScreen(
     onCancel: (() -> Unit)? = null,
     vm: DispatcharrSyncStepViewModel = hiltViewModel(),
 ) {
+    // This launch already asked about Dispatcharr Sync: no upgrade offer on top.
+    remember { com.aeriotv.android.core.sync.dsync.DsyncUpgradeOffer.onboardedThisLaunch = true }
     var ready by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     // Rule 4: both sides hold differing data; the prompt decides before Turn On.
@@ -183,9 +188,52 @@ fun DispatcharrSyncStepScreen(
         return
     }
 
+    SyncPromptLayout(
+        title = "Turn on Dispatcharr Sync?",
+        lead = if (restore) QR_RESTORE_COPY else null,
+        body = "Your favorites, watch progress, reminders, and preferences are stored on your " +
+            "Dispatcharr server under each profile and follow you to every device. " +
+            "Admins on the server can view this data.",
+        primaryLabel = "Turn On",
+        secondaryLabel = "Skip",
+        busy = busy,
+        primaryFocus = turnOnFocus,
+        onPrimary = {
+            if (!busy) {
+                busy = true
+                scope.launch { runTurnOn(false) }
+            }
+        },
+        onSecondary = { if (!busy) scope.launch { vm.releaseHeld(); onDone() } },
+    )
+}
+
+/**
+ * Full-screen Dispatcharr Sync prompt layout shared by the onboarding step and
+ * the main-screen offers (matches the Apple prompts): centered title, body, a
+ * filled accent pill, an outlined pill, and an optional footer.
+ */
+@Composable
+fun SyncPromptLayout(
+    title: String,
+    body: String,
+    primaryLabel: String,
+    secondaryLabel: String,
+    onPrimary: () -> Unit,
+    onSecondary: () -> Unit,
+    modifier: Modifier = Modifier,
+    lead: String? = null,
+    busy: Boolean = false,
+    primaryFocus: androidx.compose.ui.focus.FocusRequester? = null,
+    footer: String? = "You can change this later in Settings > Sync.",
+) {
+    if (com.aeriotv.android.ui.settings.rememberIsTvDevice()) {
+        TvSyncPromptLayout(title, body, primaryLabel, secondaryLabel, onPrimary, onSecondary, modifier, lead, busy, primaryFocus, footer)
+        return
+    }
     val vp = com.aeriotv.android.ui.adaptive.rememberViewport()
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
@@ -201,24 +249,22 @@ fun DispatcharrSyncStepScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                "Turn on Dispatcharr Sync?",
+                title,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onBackground,
                 textAlign = TextAlign.Center,
             )
-            if (restore) {
+            if (lead != null) {
                 Text(
-                    QR_RESTORE_COPY,
+                    lead,
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onBackground,
                     textAlign = TextAlign.Center,
                 )
             }
             Text(
-                "Your favorites, watch progress, reminders, and preferences are stored on your " +
-                    "Dispatcharr server under each profile and follow you to every device. " +
-                    "Admins on the server can view this data.",
+                body,
                 style = MaterialTheme.typography.bodyMedium.subtext(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -227,13 +273,9 @@ fun DispatcharrSyncStepScreen(
             // Buttons are never disabled mid-flow (TV focus would fall away);
             // taps are ignored while busy instead.
             Button(
-                onClick = {
-                    if (busy) return@Button
-                    busy = true
-                    scope.launch { runTurnOn(false) }
-                },
+                onClick = onPrimary,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp)
-                    .focusRequester(turnOnFocus)
+                    .then(if (primaryFocus != null) Modifier.focusRequester(primaryFocus) else Modifier)
                     .dpadFocusRing(RoundedCornerShape(50), onFilled = true),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.primary,
@@ -241,18 +283,126 @@ fun DispatcharrSyncStepScreen(
                 ),
             ) {
                 if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
-                else Text("Turn On", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                else Text(primaryLabel, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             }
             OutlinedButton(
-                onClick = { if (!busy) scope.launch { vm.releaseHeld(); onDone() } },
+                onClick = onSecondary,
                 modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp).dpadFocusRing(RoundedCornerShape(50)),
-            ) { Text("Skip", style = MaterialTheme.typography.titleMedium) }
-            Text(
-                "You can change this later in Settings > Sync.",
-                style = MaterialTheme.typography.bodySmall.subtext(),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-            )
+            ) { Text(secondaryLabel, style = MaterialTheme.typography.titleMedium) }
+            if (footer != null) {
+                Text(
+                    footer,
+                    style = MaterialTheme.typography.bodySmall.subtext(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * TV geometry of [SyncPromptLayout], measured from the Apple TV prompt
+ * (DispatcharrSyncStepView on tvOS, 1920x1080 points): a 900 point column,
+ * 38 point title, 24 point body, 66 point capsule buttons with 26 point
+ * labels, a 20 point footer, 20 point gaps (28 above Turn On), and the block
+ * centered vertically. Every size scales with screen height so a 1080p
+ * Streamer draws the same pixels as the Apple TV.
+ */
+@Composable
+private fun TvSyncPromptLayout(
+    title: String,
+    body: String,
+    primaryLabel: String,
+    secondaryLabel: String,
+    onPrimary: () -> Unit,
+    onSecondary: () -> Unit,
+    modifier: Modifier,
+    lead: String?,
+    busy: Boolean,
+    primaryFocus: androidx.compose.ui.focus.FocusRequester?,
+    footer: String?,
+) {
+    androidx.compose.foundation.layout.BoxWithConstraints(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        // One Apple TV point, in dp, for this screen.
+        val u = maxHeight / 1080f
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        fun sp(points: Float) = with(density) { (u * points).toSp() }
+        val column = maxWidth * (900f / 1920f)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = u * 80f, vertical = u * 60f),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                modifier = Modifier.width(column),
+                verticalArrangement = Arrangement.spacedBy(u * 20f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    title,
+                    fontSize = sp(34f),
+                    lineHeight = sp(41f),
+                    letterSpacing = 0.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    textAlign = TextAlign.Center,
+                )
+                if (lead != null) {
+                    Text(
+                        lead,
+                        fontSize = sp(23f),
+                        lineHeight = sp(28f),
+                        letterSpacing = 0.sp,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                Text(
+                    body,
+                    style = MaterialTheme.typography.bodyMedium.subtext(),
+                    fontSize = sp(20f),
+                    lineHeight = sp(26.5f),
+                    letterSpacing = 0.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                // Shared onboarding pill; ring 3 Apple TV points (3 px at 1080p).
+                com.aeriotv.android.feature.onboarding.components.OnboardingPill(
+                    filled = true,
+                    onClick = onPrimary,
+                    ringWidth = u * 3f,
+                    modifier = Modifier.padding(top = u * 8f).fillMaxWidth().height(u * 66f)
+                        .then(if (primaryFocus != null) Modifier.focusRequester(primaryFocus) else Modifier)
+                        .onFocusChanged { if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("prompt:$primaryLabel") },
+                ) {
+                    if (busy) CircularProgressIndicator(Modifier.size(u * 30f), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = u * 3f)
+                    else Text(primaryLabel, fontSize = sp(23f), letterSpacing = 0.sp, fontWeight = FontWeight.Bold)
+                }
+                com.aeriotv.android.feature.onboarding.components.OnboardingPill(
+                    filled = false,
+                    onClick = onSecondary,
+                    ringWidth = u * 3f,
+                    modifier = Modifier.fillMaxWidth().height(u * 66f)
+                        .onFocusChanged { if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("prompt:$secondaryLabel") },
+                ) { Text(secondaryLabel, fontSize = sp(23f), letterSpacing = 0.sp, fontWeight = FontWeight.SemiBold) }
+                if (footer != null) {
+                    Text(
+                        footer,
+                        style = MaterialTheme.typography.bodySmall.subtext(),
+                        fontSize = sp(17f),
+                        lineHeight = sp(21f),
+                        letterSpacing = 0.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
         }
     }
 }

@@ -820,12 +820,16 @@ fun Modifier.dpadFocusRing(
     // primary Button, a selected pill). An accent ring on an accent fill is
     // invisible, so focus then draws a white ring plus a slight scale.
     onFilled: Boolean = false,
+    ringWidth: androidx.compose.ui.unit.Dp = SettingsFocusRingWidth,
+    // False keeps a focused filled control at its resting size (tvOS
+    // TVNoHighlightButtonStyle without scalesOnFocus): only the ring changes.
+    scaleOnFocus: Boolean = true,
 ): Modifier {
     var focused by remember { mutableStateOf(false) }
     return this
         .onFocusChanged { focused = it.isFocused }
         .then(
-            if (onFilled && focused) {
+            if (onFilled && focused && scaleOnFocus) {
                 Modifier.graphicsLayer { scaleX = 1.04f; scaleY = 1.04f }
             } else {
                 Modifier
@@ -843,7 +847,7 @@ fun Modifier.dpadFocusRing(
             },
         )
         .border(
-            width = SettingsFocusRingWidth,
+            width = ringWidth,
             color = if (!focused) androidx.compose.ui.graphics.Color.Transparent
             else if (onFilled) androidx.compose.ui.graphics.Color.White
             else MaterialTheme.colorScheme.primary,

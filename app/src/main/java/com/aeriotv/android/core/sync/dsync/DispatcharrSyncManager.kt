@@ -112,6 +112,8 @@ class DispatcharrSyncManager @Inject constructor(
         /** "Sync data too large", "Sync storage on the server is full", "Sign in again to sync", or null. */
         val message: String? = null,
         val running: Boolean = false,
+        /** The record vanished after this device's first read: the host asks Upload Again or Turn Off. */
+        val recordMissing: Boolean = false,
     )
 
     private val _ui = MutableStateFlow(Ui())
@@ -163,6 +165,10 @@ class DispatcharrSyncManager @Inject constructor(
         val tooLarge = HashSet<DsyncKey>()
         var serverFull = false
         var paused = false
+        /** Record missing after the first read: no pull or write until the user answers ([DsyncMissingRecord]). */
+        @Volatile var missingHold = false
+        /** The user chose Upload Again: the next pull seeds from local as a first read does. */
+        @Volatile var missingUpload = false
         val serverBytes = HashMap<String, Long>()
         /** Bucket wire name -> list `bytes` when that bucket was last fetched. */
         val fetchedBytes = HashMap<String, Long>()
@@ -811,6 +817,27 @@ class DispatcharrSyncManager @Inject constructor(
             out
         }
 
+    /**
+     * Upgrade offer (read only): does this account already hold a Dispatcharr
+     * Sync record, under `<username>.aeriotv` or the legacy key? Same reads as
+     * [serverSummary]; nothing is written or moved.
+     */
+    suspend fun upgradeRecordState(playlistId: String): DsyncUpgradeOffer.Record =
+        kotlinx.coroutines.withContext(ProfileScope.defaultOnly()) {
+            val err = DsyncUpgradeOffer.Record.Error
+            val row = playlistDao.byId(playlistId) ?: return@withContext err
+            val apiKey = row.apiKey?.takeIf { it.isNotBlank() } ?: return@withContext err
+            val base = repository.get().effectiveBaseUrl(row)
+            val name = runCatching { client.fetchMe(base, apiKey) }.getOrNull()?.username.orEmpty()
+            val main = DsyncKeyName.main(name) ?: return@withContext err
+            for (key in listOf(main, DsyncKeyName.LEGACY_MAIN)) {
+                val r = runCatching { client.appDataGet(base, apiKey, key) }.getOrNull() ?: return@withContext err
+                if (r.status == 404) continue
+                return@withContext if (r.ok) DsyncUpgradeOffer.Record.Found else err
+            }
+            DsyncUpgradeOffer.Record.Missing
+        }
+
     // ---- Rule 5: convergence with Google Drive ----
 
     /**
@@ -1062,6 +1089,11 @@ class DispatcharrSyncManager @Inject constructor(
             return@withLock
         }
         val c = conn(s) ?: return@withLock
+        if (s.missingHold) {
+            Log.i(TAG, "[DSYNC] pull ($reason) held: record missing, waiting for the answer")
+            return@withLock
+        }
+        val hadFirstRead = state.getBoolean(k("fpdone", s), false)
         s.listOk = false
         s.pullComplete = false
         s.bucketFailed = false
@@ -1095,6 +1127,14 @@ class DispatcharrSyncManager @Inject constructor(
                 }
             }
             if (!migrateKey(s, c)) return@withLock
+            val recordMissing = DsyncBucket.entries.none { wire(s, it) in s.serverBytes }
+            if (DsyncMissingRecord.decide(hadFirstRead && !s.missingUpload, recordMissing) == DsyncMissingRecord.Action.Prompt) {
+                s.missingHold = true
+                _ui.value = _ui.value.copy(recordMissing = true)
+                Log.i(TAG, "[DSYNC] record missing after first read: prompting")
+                return@withLock
+            }
+            s.missingUpload = false
             for (b in DsyncBucket.entries) {
                 if (session !== s) return@withLock
                 val keys = b.keys.filter { enabled(it, s) }
@@ -1452,6 +1492,21 @@ class DispatcharrSyncManager @Inject constructor(
         schedule(s, key, if (key == DsyncKey.Profiles) PEEK_PUSH_DEBOUNCE_MS else DEBOUNCE_MS)
     }
 
+    /**
+     * The answer to the record-missing prompt. Upload Again seeds from local
+     * as the first-write path does; Turn Off keeps the hold (no writes) while
+     * the caller turns the switch off, and leaves the server untouched.
+     */
+    fun answerMissingRecord(upload: Boolean) {
+        val s = session
+        _ui.value = _ui.value.copy(recordMissing = false)
+        Log.i(TAG, "[DSYNC] record missing: answer=${if (upload) "upload-again" else "turn-off"}")
+        if (s == null || !upload) return
+        s.missingUpload = true
+        s.missingHold = false
+        scope.launch { pullAll(s, "missing-upload") }
+    }
+
     private fun schedule(s: Session, key: DsyncKey, delayMs: Long) {
         // A peek writes only from peekPush, under profilesPeekMutex.
         if (s.peek) return
@@ -1488,7 +1543,7 @@ class DispatcharrSyncManager @Inject constructor(
     }
 
     private suspend fun writeLocked(s: Session, key: DsyncKey, retry413: Boolean) {
-        if (!s.live() || s.paused) return
+        if (!s.live() || s.paused || s.missingHold) return
         if (key in DsyncCoexistence.FORCE_KEYS && choiceHeld()) {
             setDirty(s, key, true)
             return
