@@ -94,6 +94,7 @@ class OnDemandViewModel @Inject constructor(
     private val hiddenTitlesStore: com.aeriotv.android.core.preferences.HiddenTitlesStore,
     private val settleGate: AppSettleGate,
     private val catalogStore: VodCatalogStore,
+    private val keyRecheck: com.aeriotv.android.core.network.DispatcharrKeyRecheck,
 ) : ViewModel() {
 
     data class UiState(
@@ -1073,6 +1074,15 @@ class OnDemandViewModel @Inject constructor(
     fun ensureLoaded() = startInitialLoads()
 
     init {
+        // A held API key proved good again: run the sweeps a refresh runs.
+        viewModelScope.launch {
+            keyRecheck.recovered.collect { id ->
+                if (playlistRepository.activePlaylist()?.id == id) {
+                    startMovieSweep(background = false)
+                    startSeriesSweep(background = false)
+                }
+            }
+        }
         startLibraryPipeline(isMovie = true)
         startLibraryPipeline(isMovie = false)
         deferredStart = viewModelScope.launch {
@@ -1683,7 +1693,7 @@ class OnDemandViewModel @Inject constructor(
     private var seriesSweepJob: kotlinx.coroutines.Job? = null
 
     /** Foreground sweep (pull to refresh, playlist switch, Refresh Everything). */
-    fun refresh() = startMovieSweep(background = false)
+    fun refresh() { keyRecheck.userRefresh(); startMovieSweep(background = false) }
 
     // True while the ACTIVE movie sweep is the quiet background one, so a
     // foreground request can preempt it instead of being swallowed by the
@@ -1831,7 +1841,7 @@ class OnDemandViewModel @Inject constructor(
     }
 
     /** Foreground series sweep; see [refresh]. */
-    fun refreshSeries() = startSeriesSweep(background = false)
+    fun refreshSeries() { keyRecheck.userRefresh(); startSeriesSweep(background = false) }
 
     private fun startSeriesSweep(background: Boolean) {
         if (seriesSweepJob?.isActive == true) {
@@ -2050,6 +2060,9 @@ class OnDemandViewModel @Inject constructor(
                         } catch (u: DispatcharrError.Unauthorized) {
                             failure = u
                             null
+                        } catch (r: DispatcharrError.RateLimited) {
+                            failure = r
+                            null
                         }
                         Triple(lane, fetched, failure)
                     }
@@ -2057,10 +2070,14 @@ class OnDemandViewModel @Inject constructor(
             }
             for ((lane, page, failure) in results) {
                 if (failure != null) {
-                    // The broker already tried to recover the key; every other
-                    // lane would 401 too. Stop, keep every position for next
-                    // time.
-                    warnUnlessCancelled("VOD $label sweep: unauthorized; stopping (positions kept)", failure)
+                    // The broker already tried to recover the key (or the
+                    // server is parked after a 429); every other lane would
+                    // fail too. Stop, keep every position for next time.
+                    warnUnlessCancelled(
+                        if (failure is DispatcharrError.RateLimited) "VOD $label sweep: rate-limited; stopping (positions kept)"
+                        else "VOD $label sweep: unauthorized; stopping (positions kept)",
+                        failure,
+                    )
                     aborted = true
                     continue
                 }
@@ -2219,6 +2236,11 @@ class OnDemandViewModel @Inject constructor(
                 throw c
             } catch (u: DispatcharrError.Unauthorized) {
                 throw u
+            } catch (r: DispatcharrError.RateLimited) {
+                // The server is parked after a 429: retrying inside the pause
+                // only burns attempts (each fails locally). Stop the sweep with
+                // positions kept; the next sweep resumes after the pause.
+                throw r
             } catch (t: Throwable) {
                 warnUnlessCancelled("$label page failed (attempt $attempt of $PAGE_RETRY_ATTEMPTS)", t)
                 if (attempt < PAGE_RETRY_ATTEMPTS) {

@@ -83,6 +83,7 @@ class SetUpTvViewModel @Inject constructor(
     private val profiles: ProfileManager,
     prefs: AppPreferences,
     private val repository: PlaylistRepository,
+    private val dispatcharrClient: com.aeriotv.android.core.network.DispatcharrClient,
 ) : ViewModel() {
 
     sealed interface Step {
@@ -94,8 +95,14 @@ class SetUpTvViewModel @Inject constructor(
         data class Code(val target: SetupTarget, val error: String? = null) : Step
         data class Choose(val target: SetupTarget, val code: String) : Step
         data object Sending : Step
+        /** Checking the key about to be sent; [line] is the status (or a 429 countdown). */
+        data class Checking(val line: String) : Step
+        /** The server refused the key that would be sent: nothing was sent. */
+        data class KeyRejected(val playlistId: String, val back: Step) : Step
         data object Sent : Step
         data class Error(val message: String, val back: Step) : Step
+        /** The active profile may not set up another device: nothing was sent and the sheet closes. */
+        data object Refused : Step
     }
 
     val discovery = SetupDiscovery(context)
@@ -123,7 +130,13 @@ class SetUpTvViewModel @Inject constructor(
     }
 
     fun load(pid: String?, link: String?, target: SetupTarget? = null) {
-        if (playlistId != null) return
+        if (playlistId != null) {
+            // The sheet is already open: a newer scanned link replaces the
+            // device it points at (it used to be ignored), unless a send is
+            // under way.
+            if (link != null) replaceFromLink(link)
+            return
+        }
         viewModelScope.launch {
             val id = pid ?: repository.activePlaylist()?.id
             playlistId = id
@@ -138,9 +151,22 @@ class SetUpTvViewModel @Inject constructor(
 
     /** A setup code read by the in-app scanner (or picked from Photos). */
     fun useLink(link: String) {
+        if (!setupLinkMayReplace(_step.value)) return
         val l = SetupProtocol.parseLink(link) ?: return
         val t = SetupTarget(l.name.ifBlank { "AerioTV" }, l.ip, l.port, l.pk, code = l.code)
         _step.value = afterTarget(t)
+    }
+
+    /** A second camera link while the sheet is open: start over on the new device. */
+    private fun replaceFromLink(link: String) {
+        if (!setupLinkMayReplace(_step.value)) {
+            android.util.Log.i("AerioSetup", "[SETUP] newer link ignored: a send is under way")
+            return
+        }
+        if (SetupProtocol.parseLink(link) == null) return
+        _userOnly.value = false
+        useLink(link)
+        android.util.Log.i("AerioSetup", "[SETUP] newer link replaced the pending device")
     }
 
     private val isDispatcharr: Boolean get() = _source.value?.isDispatcharr == true
@@ -188,6 +214,7 @@ class SetUpTvViewModel @Inject constructor(
             is Step.Code -> afterTargetBack(s.target)
             is Step.Credential -> Step.Scope(s.target)
             is Step.Error -> s.back
+            is Step.KeyRejected -> s.back
             else -> Step.Pick
         }
     }
@@ -200,6 +227,14 @@ class SetUpTvViewModel @Inject constructor(
 
     fun send(target: SetupTarget, code: String, profileIds: Set<String>, sync: Boolean) {
         val id = playlistId ?: return
+        // The same gate as every way into this sheet, checked again here so no
+        // path (a camera link, a profile switch while the sheet was open) can
+        // send the playlist for a profile that may not set up a device.
+        if (!setupSendAllowed(locked = profiles.isPinGated(), canSetUpTv = profiles.canSetUpTv(id))) {
+            android.util.Log.i("AerioSetup", "[SETUP] send refused: this profile may not set up another device")
+            _step.value = Step.Refused
+            return
+        }
         val back = Step.Choose(target, code)
         _step.value = Step.Sending
         viewModelScope.launch {
@@ -208,6 +243,27 @@ class SetUpTvViewModel @Inject constructor(
             val t = SetupDiscovery.fresh(context, target)
             val payload = sender.buildPayload(id, profileIds, sync, userOnly = _userOnly.value)
                 ?: run { _step.value = Step.Error("This playlist could not be read.", back); return@launch }
+            // Never hand over a key the server refuses (2026-11-09): one
+            // authenticated request with exactly the key in the payload.
+            val key = payload.playlist.credential?.apiKey
+            if (payload.playlist.type == "dispatcharr" && key != null) {
+                _step.value = Step.Checking(CHECKING_LINE)
+                val base = repository.playlistById(id)?.let { repository.effectiveBaseUrl(it) } ?: payload.playlist.url
+                val verdict = com.aeriotv.android.core.setup.preflightSetupKey(
+                    check = { dispatcharrClient.checkApiKey(base, key) },
+                    onCountdown = { left, limited ->
+                        _step.value = Step.Checking(
+                            if (limited) com.aeriotv.android.core.network.serverBusyCountdown(left) else CHECKING_LINE,
+                        )
+                    },
+                )
+                android.util.Log.i("AerioSetup", "[SETUP] key check before send: $verdict")
+                if (verdict == com.aeriotv.android.core.setup.SetupKeyVerdict.Rejected) {
+                    _step.value = Step.KeyRejected(id, back)
+                    return@launch
+                }
+                _step.value = Step.Sending
+            }
             _step.value = when (val r = sender.send(t, code, payload)) {
                 SetupSender.SendResult.Ok -> {
                     // Never offered again under this key, even if the advert goodbye is lost.
@@ -222,6 +278,8 @@ class SetUpTvViewModel @Inject constructor(
     }
 
     override fun onCleared() { discovery.stop() }
+
+    private companion object { const val CHECKING_LINE = "Checking the playlist sign-in" }
 }
 
 /**
@@ -293,6 +351,16 @@ fun SetUpTvScreen(playlistId: String?, link: String?, onClose: () -> Unit, targe
                 }
                 is SetUpTvViewModel.Step.Code -> CodeStep(s, vm::submitCode)
                 is SetUpTvViewModel.Step.Choose -> ChooseStep(s, source, vm.userOnly.collectAsStateWithLifecycle().value, vm::send)
+                is SetUpTvViewModel.Step.Checking -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(Modifier.size(24.dp)); Text(s.line, color = MaterialTheme.colorScheme.onBackground)
+                }
+                is SetUpTvViewModel.Step.KeyRejected -> {
+                    Text(com.aeriotv.android.core.setup.SETUP_KEY_REJECTED_MESSAGE, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
+                    SetupPrimaryButton("Edit Playlist", onClick = {
+                        com.aeriotv.android.feature.settings.EditPlaylistRequest.open(s.playlistId)
+                        onClose()
+                    })
+                }
                 SetUpTvViewModel.Step.Sending -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     CircularProgressIndicator(Modifier.size(24.dp)); Text("Sending to the other device", color = MaterialTheme.colorScheme.onBackground)
                 }
@@ -304,8 +372,11 @@ fun SetUpTvScreen(playlistId: String?, link: String?, onClose: () -> Unit, targe
                     Text(s.message, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
                     SetupPrimaryButton("Try Again", onClick = vm::back)
                 }
+                SetUpTvViewModel.Step.Refused -> LaunchedEffect(Unit) { onClose() }
             }
-            if (step !is SetUpTvViewModel.Step.Sent && step !is SetUpTvViewModel.Step.Sending) {
+            if (step !is SetUpTvViewModel.Step.Sent && step !is SetUpTvViewModel.Step.Sending &&
+                step !is SetUpTvViewModel.Step.Checking && step !is SetUpTvViewModel.Step.Refused
+            ) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (step !is SetUpTvViewModel.Step.Pick) SetupSecondaryButton("Back", onClick = vm::back, modifier = Modifier.weight(1f))
                     SetupSecondaryButton("Cancel", onClick = onClose, modifier = Modifier.weight(1f))

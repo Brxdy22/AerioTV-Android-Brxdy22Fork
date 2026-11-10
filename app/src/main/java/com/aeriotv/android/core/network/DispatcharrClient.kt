@@ -85,6 +85,56 @@ const val AUTH_MODE_BEARER = "bearer"
  *  cursor. Hitting the cap logs a warning rather than failing. */
 private const val MAX_LIST_PAGES = 200
 
+/**
+ * Dispatcharr's own key check refused the key (ApiKeyAuthentication): "Invalid
+ * API key" for an unknown key, "User inactive" for the key of a deactivated
+ * account. Both are final for every header shape, and the server counts each
+ * one against its per-IP failed-key limit (10 per minute), so the probe stops
+ * at the first. Trying the other shapes for "User inactive" cost two more
+ * counted failures per call and could lock out every device on the network.
+ */
+internal fun isDispatcharrInvalidKeyBody(body: String): Boolean =
+    body.contains("Invalid API key", ignoreCase = true) ||
+        body.contains("User inactive", ignoreCase = true)
+
+/**
+ * One in-flight run per key: concurrent callers for the same key await the
+ * first caller's result instead of running their own (owner 2026-11-10: only
+ * one caller probes a given key at a time). A leader that is cancelled hands
+ * the run to the next waiter rather than failing the others.
+ */
+internal class SingleFlight<K : Any, V> {
+    private val inFlight = java.util.concurrent.ConcurrentHashMap<K, kotlinx.coroutines.CompletableDeferred<V>>()
+
+    suspend fun run(key: K, block: suspend () -> V): V {
+        while (true) {
+            val mine = kotlinx.coroutines.CompletableDeferred<V>()
+            val running = inFlight.putIfAbsent(key, mine)
+            if (running == null) {
+                try {
+                    val value = block()
+                    mine.complete(value)
+                    return value
+                } catch (t: Throwable) {
+                    mine.completeExceptionally(t)
+                    throw t
+                } finally {
+                    inFlight.remove(key, mine)
+                }
+            }
+            try {
+                return running.await()
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                // Our own cancellation ends here; the leader's means run it ourselves.
+                if (kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]?.isActive == false) throw c
+            }
+        }
+    }
+
+    /** Runs in flight right now (tests). */
+    val size: Int get() = inFlight.size
+}
+
 @Singleton
 class DispatcharrClient @Inject constructor() {
 
@@ -102,6 +152,8 @@ class DispatcharrClient @Inject constructor() {
 
     private val client = HttpClient(OkHttp) {
         installSanitizedLogging()
+        // 429 pause and (later) the rejected-key gate: DispatcharrRequestGate.
+        install(DispatcharrGatePlugin)
         install(HttpTimeout) {
             requestTimeoutMillis = 60_000
             connectTimeoutMillis = 15_000
@@ -200,8 +252,7 @@ class DispatcharrClient @Inject constructor() {
             // credential problems that did not exist (Discord 2026-08-16,
             // iOS twin fixed the same day). Self-clearing: say WAIT, and
             // park every login to this server until Retry-After.
-            val secs = DispatcharrLoginGate.parseRetryAfter(response.headers["Retry-After"])
-                ?: DispatcharrLoginGate.DEFAULT_RETRY_AFTER_S
+            val secs = DispatcharrRequestGate.parseRetryAfter(response.headers["Retry-After"])
             DispatcharrLoginGate.parkServer(baseUrl, secs)
             throw DispatcharrError.LoginThrottled(secs)
         }
@@ -256,8 +307,7 @@ class DispatcharrClient @Inject constructor() {
             )
         }
         if (code == 429) {
-            val secs = DispatcharrLoginGate.parseRetryAfter(response.headers["Retry-After"])
-                ?: DispatcharrLoginGate.DEFAULT_RETRY_AFTER_S
+            val secs = DispatcharrRequestGate.parseRetryAfter(response.headers["Retry-After"])
             DispatcharrLoginGate.parkServer(baseUrl, secs)
             throw DispatcharrError.LoginThrottled(secs)
         }
@@ -374,6 +424,38 @@ class DispatcharrClient @Inject constructor() {
      * derives it from the level). Null on ANY failure so a transient error
      * never clobbers a persisted value. Mirrors iOS DispatcharrUser 5d7763e.
      */
+    /** Outcome of [checkApiKey]. */
+    sealed interface KeyCheck {
+        data object Accepted : KeyCheck
+        /** 401/403, or a key the gate already holds as rejected (nothing sent). */
+        data object Rejected : KeyCheck
+        /** No verdict: [retryAfterSeconds] set for a 429, null for a network error or any other status. */
+        data class Unknown(val retryAfterSeconds: Long?) : KeyCheck
+    }
+
+    /**
+     * One authenticated GET of /api/accounts/users/me/ (the lightest call
+     * that needs a valid key; already in the README path tables) with
+     * exactly [apiKey]. The "Set up another device" sender runs it before
+     * handing a key over, so it never sends one the server refuses.
+     */
+    suspend fun checkApiKey(baseUrl: String, apiKey: String): KeyCheck = try {
+        val response = client.get("${baseUrl.trimEnd('/')}/api/accounts/users/me/") { applyAuth(apiKey) }
+        when (response.status.value) {
+            in 200..299 -> KeyCheck.Accepted.also { DispatcharrRequestGate.clearKey(apiKey) }
+            401, 403 -> KeyCheck.Rejected
+            else -> KeyCheck.Unknown(null)
+        }
+    } catch (c: kotlinx.coroutines.CancellationException) {
+        throw c
+    } catch (k: DispatcharrError.KeyRejected) {
+        KeyCheck.Rejected
+    } catch (r: DispatcharrError.RateLimited) {
+        KeyCheck.Unknown(r.retryAfterSeconds)
+    } catch (t: Throwable) {
+        KeyCheck.Unknown(null)
+    }
+
     /** Profiles: the full /api/accounts/users/me/ record for the user [apiKey]
      *  authenticates as, or null on any failure. */
     suspend fun fetchMe(baseUrl: String, apiKey: String): MeResponse? = runCatching {
@@ -751,12 +833,73 @@ class DispatcharrClient @Inject constructor() {
      */
     suspend fun verifyConnection(baseUrl: String, apiKey: String): VersionResponse {
         val url = "${baseUrl.trimEnd('/')}/api/core/version/"
-        val response: HttpResponse = client.get(url) { applyAuth(apiKey) }
+        // An explicit key check: runs even for a key the gate holds as
+        // rejected (the user may have fixed it on the server), and a pass
+        // clears that state.
+        val response: HttpResponse = client.get(url) { applyAuth(apiKey); attributes.put(BypassKeyGate, true) }
         unauthorizedCheck(response, url)
         if (!response.status.isSuccess()) {
             throw DispatcharrError.Transport("Connection check failed: HTTP ${response.status.value} ${response.status.description}")
         }
+        DispatcharrRequestGate.clearKey(apiKey)
         return response.body()
+    }
+
+    /** Outcome of [probeApiKey]. */
+    sealed interface KeyProbe {
+        /** The key authenticated under [mode]. */
+        data class Accepted(val mode: String) : KeyProbe
+        /** Dispatcharr itself said the key is invalid, or every header shape got 401/403. */
+        data object Rejected : KeyProbe
+        /** No answer that proves anything (network error, 5xx). */
+        data object Unknown : KeyProbe
+    }
+
+    /**
+     * Is [apiKey] itself good? /api/core/version/ is AllowAny on Dispatcharr,
+     * but an INVALID key is still authenticated and refused there (401
+     * "Invalid API key"), while a missing key passes. So a 2xx proves the
+     * key (or its header shape), and a 401 whose body names the invalid key
+     * proves rejection on the first request: no second and third shape, each
+     * of which would count against the server's failed-key budget.
+     * Header-shape fallbacks (X-API-Key alone, Bearer) run only when the
+     * 401 does not come from Dispatcharr's key check (a reverse proxy).
+     * A 429 propagates as [DispatcharrError.RateLimited].
+     */
+    suspend fun probeApiKey(baseUrl: String, apiKey: String): KeyProbe =
+        // Every caller that hit a 401 with this key at the same moment (the
+        // channel refresh, the guide, On Demand lanes, a poll) shares ONE
+        // probe; each would otherwise spend its own counted failures.
+        keyProbes.run(DispatcharrRequestGate.serverKey(baseUrl) + "|" + DispatcharrRequestGate.keyHash(apiKey)) {
+            probeApiKeyUnshared(baseUrl, apiKey)
+        }
+
+    private val keyProbes = SingleFlight<String, KeyProbe>()
+
+    private suspend fun probeApiKeyUnshared(baseUrl: String, apiKey: String): KeyProbe {
+        val url = "${baseUrl.trimEnd('/')}/api/core/version/"
+        var sawAuthFailure = false
+        for (mode in listOf(AUTH_MODE_BOTH, AUTH_MODE_XAPIKEY, AUTH_MODE_BEARER)) {
+            val response: HttpResponse = try {
+                client.get(url) { applyAuth(apiKey, mode) }
+            } catch (r: DispatcharrError.RateLimited) {
+                throw r
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                return KeyProbe.Unknown
+            }
+            val code = response.status.value
+            if (response.status.isSuccess()) {
+                runCatching { Url(baseUrl).host }.getOrNull()?.let { hostAuthModes[it] = mode }
+                return KeyProbe.Accepted(mode)
+            }
+            if (code != 401 && code != 403) return KeyProbe.Unknown
+            sawAuthFailure = true
+            val body = runCatching { response.bodyAsText() }.getOrNull().orEmpty()
+            if (isDispatcharrInvalidKeyBody(body)) return KeyProbe.Rejected
+        }
+        return if (sawAuthFailure) KeyProbe.Rejected else KeyProbe.Unknown
     }
 
     /**
@@ -1298,24 +1441,32 @@ class DispatcharrClient @Inject constructor() {
      * Bearer. Returns null when no shape authenticates (the key itself is
      * bad) or the server is unreachable.
      */
-    suspend fun detectAuthMode(baseUrl: String, apiKey: String): String? {
+    /**
+     * The held-key re-check (DispatcharrKeyRecheck): EXACTLY one request,
+     * /api/core/version/ with [apiKey] in the host's recorded header shape,
+     * past the rejected-key gate. 2xx = Accepted, 401/403 = Rejected,
+     * anything else (network, 5xx, a 429, which also pauses the server) =
+     * Unknown.
+     */
+    suspend fun probeApiKeyOnce(baseUrl: String, apiKey: String): KeyProbe {
         val url = "${baseUrl.trimEnd('/')}/api/core/version/"
-        for (mode in listOf(AUTH_MODE_BOTH, AUTH_MODE_XAPIKEY, AUTH_MODE_BEARER)) {
-            val ok = try {
-                val response: HttpResponse = client.get(url) { applyAuth(apiKey, mode) }
-                response.status.isSuccess()
-            } catch (t: Throwable) {
-                // Transport-level failure: no shape will fare better.
-                return null
+        val mode = runCatching { hostAuthModes[Url(baseUrl).host] }.getOrNull() ?: AUTH_MODE_BOTH
+        return try {
+            val response = client.get(url) { applyAuth(apiKey, mode); attributes.put(BypassKeyGate, true) }
+            when (response.status.value) {
+                in 200..299 -> KeyProbe.Accepted(mode)
+                401, 403 -> KeyProbe.Rejected
+                else -> KeyProbe.Unknown
             }
-            if (ok) {
-                runCatching { Url(baseUrl).host }.getOrNull()
-                    ?.let { hostAuthModes[it] = mode }
-                return mode
-            }
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            KeyProbe.Unknown
         }
-        return null
     }
+
+    suspend fun detectAuthMode(baseUrl: String, apiKey: String): String? =
+        (runCatching { probeApiKey(baseUrl, apiKey) }.getOrNull() as? KeyProbe.Accepted)?.mode
 
     /**
      * Returns the canonical playback URL for a Dispatcharr channel via the
