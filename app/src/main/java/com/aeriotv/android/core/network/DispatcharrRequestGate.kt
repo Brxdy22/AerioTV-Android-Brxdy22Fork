@@ -76,6 +76,8 @@ object DispatcharrRequestGate {
         val set = rejected.getOrPut(hash) { ConcurrentHashMap.newKeySet() }
         val fresh = set.add(playlistId)
         if (fresh) {
+            // Drive may already carry this playlist's good key (DriveSyncManager).
+            runCatching { onKeyHeld?.invoke(playlistId) }
             _prompt.value = Prompt(playlistId, playlistName, passwordToo)
             if (baseUrl.isNotBlank()) {
                 rechecks.putIfAbsent(hash, Recheck(hash, key.trim(), baseUrl, serverKey(baseUrl), playlistId, passwordToo, clock()))
@@ -87,6 +89,9 @@ object DispatcharrRequestGate {
     // ---- Automatic re-check while a key is held (owner 2026-11-09: "We
     // don't want to just block access but we don't want constant retries
     // that force a server-side block from repeated attempts either.") ----
+
+    /** Told when a key is newly held for a playlist (Drive Sync re-pulls credentials). */
+    @Volatile var onKeyHeld: ((playlistId: String) -> Unit)? = null
 
     /** Scheduled probes after the rejection: 1, 5, and 15 minutes. */
     val RECHECK_OFFSETS_MS = longArrayOf(60_000, 300_000, 900_000)
@@ -239,11 +244,18 @@ object DispatcharrRequestGate {
         return secs.coerceIn(1, MAX_RETRY_AFTER_S)
     }
 
+    /** Why each server is paused: the reason of its latest 429. */
+    private val pausedReasons = ConcurrentHashMap<String, RateLimitReason>()
+
     /** Park [serverKey] for [seconds] (a later, longer 429 extends it; a shorter one never shortens it). */
-    fun pause(serverKey: String, seconds: Long) {
+    fun pause(serverKey: String, seconds: Long, reason: RateLimitReason = RateLimitReason.Other) {
         val until = clock() + seconds.coerceIn(1, MAX_RETRY_AFTER_S) * 1000
         pausedUntil.merge(serverKey, until) { old, new -> maxOf(old, new) }
+        pausedReasons[serverKey] = reason
     }
+
+    /** The reason of the 429 that paused [serverKey] ([RateLimitReason.Other] when unknown). */
+    fun pausedReason(serverKey: String): RateLimitReason = pausedReasons[serverKey] ?: RateLimitReason.Other
 
     /** Seconds left on [serverKey]'s pause, 0 when requests may go out. */
     fun pausedSeconds(serverKey: String): Long {
@@ -253,11 +265,62 @@ object DispatcharrRequestGate {
         return (left + 999) / 1000
     }
 
+    // ---- Replaced keys (a silent re-sign-in swapped the key) ----
+
+    /** How long requests built with a replaced key are rewritten to the new one. */
+    const val REPLACED_KEY_TTL_MS = 600_000L
+
+    /** Old key hash -> the key that replaced it, and until when (on [clock]). */
+    private val replaced = ConcurrentHashMap<String, Pair<String, Long>>()
+
+    /**
+     * A re-sign-in replaced [old] with [new]. Requests already built with
+     * [old] (a sweep or poll that captured the key, a call in flight) go out
+     * with [new] for [REPLACED_KEY_TTL_MS] instead of spending a counted
+     * failed-key attempt each on a key the server no longer knows.
+     */
+    fun noteKeyReplaced(old: String, new: String) {
+        val o = old.trim()
+        val n = new.trim()
+        if (o.isEmpty() || n.isEmpty() || o == n) return
+        replaced[keyHash(o)] = n to clock() + REPLACED_KEY_TTL_MS
+    }
+
+    /** The current key for [key] when it was replaced in the last [REPLACED_KEY_TTL_MS] (follows a chain), else null. */
+    fun replacementFor(key: String): String? {
+        var current = key.trim()
+        var found: String? = null
+        repeat(4) {
+            val h = keyHash(current)
+            val entry = replaced[h] ?: return found
+            if (clock() >= entry.second) {
+                replaced.remove(h, entry)
+                return found
+            }
+            found = entry.first
+            current = entry.first
+        }
+        return found
+    }
+
     /** Test hook: forget every pause. */
     fun resetForTests() {
         pausedUntil.clear()
+        pausedReasons.clear()
         rejected.clear()
         rechecks.clear()
+        replaced.clear()
         _prompt.value = null
     }
+}
+
+/**
+ * Pure rule for a 401 on [usedKey]: retry with [current] when the playlist's
+ * key has changed since the call was built and the new key is not itself held
+ * as rejected; null = the key did not change, so probe it as usual.
+ */
+internal fun currentKeyAfterSwap(usedKey: String, current: String?, isRejected: (String) -> Boolean): String? {
+    val c = current?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    if (c == usedKey.trim() || isRejected(c)) return null
+    return c
 }

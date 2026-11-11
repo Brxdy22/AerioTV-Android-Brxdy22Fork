@@ -232,8 +232,9 @@ class DispatcharrClient @Inject constructor() {
         // A 429 earlier in the throttle window: do not spend another attempt
         // (each one re-arms nothing but still counts against the user's IP).
         DispatcharrLoginGate.serverParkedSeconds(baseUrl).takeIf { it > 0 }?.let { left ->
-            android.util.Log.i("DispatcharrAuthBroker", "[AUTH] login throttled by the server; next attempt in ${left}s")
-            throw DispatcharrError.LoginThrottled(left)
+            val reason = DispatcharrLoginGate.parkedReason(baseUrl)
+            android.util.Log.i("DispatcharrAuthBroker", "[AUTH] login throttled by the server ($reason); next attempt in ${left}s")
+            throw DispatcharrError.LoginThrottled(left, reason)
         }
         val response: HttpResponse = try {
             client.post("${baseUrl.trimEnd('/')}/api/accounts/token/") {
@@ -263,8 +264,9 @@ class DispatcharrClient @Inject constructor() {
             // iOS twin fixed the same day). Self-clearing: say WAIT, and
             // park every login to this server until Retry-After.
             val secs = DispatcharrRequestGate.parseRetryAfter(response.headers["Retry-After"])
-            DispatcharrLoginGate.parkServer(baseUrl, secs)
-            throw DispatcharrError.LoginThrottled(secs)
+            val reason = rateLimitReasonOf(runCatching { response.bodyAsText().take(300) }.getOrNull())
+            DispatcharrLoginGate.parkServer(baseUrl, secs, reason)
+            throw DispatcharrError.LoginThrottled(secs, reason)
         }
         if (!response.status.isSuccess()) {
             throw DispatcharrError.Transport("Login transport error: HTTP $code")
@@ -318,8 +320,9 @@ class DispatcharrClient @Inject constructor() {
         }
         if (code == 429) {
             val secs = DispatcharrRequestGate.parseRetryAfter(response.headers["Retry-After"])
-            DispatcharrLoginGate.parkServer(baseUrl, secs)
-            throw DispatcharrError.LoginThrottled(secs)
+            val reason = rateLimitReasonOf(runCatching { response.bodyAsText().take(300) }.getOrNull())
+            DispatcharrLoginGate.parkServer(baseUrl, secs, reason)
+            throw DispatcharrError.LoginThrottled(secs, reason)
         }
         if (!response.status.isSuccess()) {
             throw DispatcharrError.Transport("Refresh transport error: HTTP $code")
@@ -791,13 +794,24 @@ class DispatcharrClient @Inject constructor() {
     suspend fun fetchServerVersion(baseUrl: String, apiKey: String): String? =
         runCatching { verifyConnection(baseUrl, apiKey).version }.getOrNull()
 
+    /**
+     * The account's assigned channel profile ids, or null when the server
+     * gives no usable answer. A 401 is thrown as [DispatcharrError.Unauthorized]
+     * (see [fetchAccountSnapshot]) so a caller inside
+     * [DispatcharrAuthBroker.withApiKeyRetry] re-signs in or holds the key.
+     */
     suspend fun fetchCurrentUserProfileIds(baseUrl: String, apiKey: String): List<Int>? = runCatching {
         val url = "${baseUrl.trimEnd('/')}/api/accounts/users/me/"
         val response = client.get(url) { applyAuth(apiKey) }
+        if (response.status.value == 401) {
+            throw DispatcharrError.Unauthorized(
+                "Dispatcharr rejected the api_key for $url (HTTP 401). Admin probably rotated it.",
+            )
+        }
         if (!response.status.isSuccess()) return@runCatching null
         val me: MeResponse = response.body()
         me.channelProfiles
-    }.getOrNull()
+    }.orNullKeepingAuthFailures()
 
     /**
      * Default User-Agent for every Dispatcharr API call. Mirrors iOS

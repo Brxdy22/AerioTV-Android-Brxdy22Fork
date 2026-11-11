@@ -7,6 +7,7 @@ import com.aeriotv.android.DeepLinkTarget
 import com.aeriotv.android.core.network.RateLimitRetry
 import com.aeriotv.android.core.network.rateLimitSeconds
 import com.aeriotv.android.core.network.rateLimitedMessage
+import com.aeriotv.android.core.network.rateLimitReason
 import com.aeriotv.android.core.network.serverBusyCountdown
 import com.aeriotv.android.core.data.EPGProgramme
 import com.aeriotv.android.core.data.guideMatchKey
@@ -499,6 +500,28 @@ class PlaylistViewModel @Inject constructor(
                     Log.i(TAG, "held key recovered for ${id.take(8)}; refreshing the playlist")
                     refreshPlaylist(fromRecovery = true)
                 }
+            }
+        }
+        // One server account is one playlist (sync merge, Logan 2026-11-10):
+        // the playlist on screen was merged into another, so switch to the
+        // winner, then let the merged-away row go (it waited for this).
+        viewModelScope.launch {
+            _state.map { it.playlist?.id }.distinctUntilChanged().collect {
+                com.aeriotv.android.core.sync.PlaylistMerges.uiBoundId = it
+            }
+        }
+        viewModelScope.launch {
+            com.aeriotv.android.core.sync.PlaylistMerges.events.collect { e ->
+                if (_state.value.playlist?.id != e.loserId) return@collect
+                Log.i(TAG, "[MERGE] playlist on screen merged into ${e.winnerId.take(8)}; switching")
+                switchToPlaylist(e.winnerId, onDone = {
+                    if (e.deferredDelete) viewModelScope.launch {
+                        com.aeriotv.android.core.sync.PlaylistMerges.uiBoundId = e.winnerId
+                        repository.deletePlaylist(e.loserId)
+                            .onSuccess { Log.i(TAG, "[MERGE] merged-away playlist ${e.loserId.take(8)} deleted after the switch") }
+                            .onFailure { Log.w(TAG, "[MERGE] merged-away playlist delete failed: ${it.javaClass.simpleName}") }
+                    }
+                })
             }
         }
         // Profiles: a profile switch reloads the channel list, groups and VOD
@@ -1174,7 +1197,7 @@ class PlaylistViewModel @Inject constructor(
                 epgRetentionDays = s.epgRetentionDays,
             )
             RateLimitRetry.run(
-                onCountdown = { left -> _state.update { it.copy(busyMessage = serverBusyCountdown(left)) } },
+                onCountdown = { left, reason -> _state.update { it.copy(busyMessage = serverBusyCountdown(left, reason)) } },
                 onRetry = { _state.update { it.copy(busyMessage = null) } },
             ) {
                 repository.loadAndPersist(request, existingId = s.draftPlaylistId)
@@ -1275,10 +1298,10 @@ class PlaylistViewModel @Inject constructor(
      */
     private fun loadFailureMessage(prefix: String, t: Throwable): String =
         if (t is RateLimitRetry.RateLimitedFinal) {
-            t.message ?: rateLimitedMessage(t.seconds)
+            t.message ?: rateLimitedMessage(t.seconds, t.reason)
         } else if (t.rateLimitSeconds() != null) {
             // A 429 names the rate limit, never "Could not connect: HTTP 429".
-            rateLimitedMessage(t.rateLimitSeconds()!!)
+            rateLimitedMessage(t.rateLimitSeconds()!!, t.rateLimitReason())
         } else if (t is OutOfMemoryError) {
             "$prefix: playlist is too large for this device's memory. If this is an " +
                 "Xtream Codes get.php link, add it with the Xtream Codes source type instead."
@@ -2886,7 +2909,7 @@ class PlaylistViewModel @Inject constructor(
             Log.i(TAG, "testConnection: probing ${active.urlString}")
             _state.update { it.copy(testStatus = ActionStatus.Running) }
             RateLimitRetry.run(
-                onCountdown = { left -> _state.update { it.copy(testStatus = ActionStatus.Waiting(serverBusyCountdown(left))) } },
+                onCountdown = { left, reason -> _state.update { it.copy(testStatus = ActionStatus.Waiting(serverBusyCountdown(left, reason))) } },
                 onRetry = { _state.update { it.copy(testStatus = ActionStatus.Running) } },
             ) { repository.refresh(active) }.fold(
                 onSuccess = { channels ->
@@ -2905,7 +2928,7 @@ class PlaylistViewModel @Inject constructor(
                         it.copy(
                             testStatus = ActionStatus.Failure(
                                 t.rateLimitSeconds()?.let { secs ->
-                                    (t as? RateLimitRetry.RateLimitedFinal)?.message ?: rateLimitedMessage(secs)
+                                    (t as? RateLimitRetry.RateLimitedFinal)?.message ?: rateLimitedMessage(secs, t.rateLimitReason())
                                 } ?: "Connection failed: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
                             ),
                         )

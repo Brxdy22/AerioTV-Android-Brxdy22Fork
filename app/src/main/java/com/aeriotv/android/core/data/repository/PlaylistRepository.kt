@@ -310,6 +310,12 @@ class PlaylistRepository @Inject constructor(
          * which is what every caller other than Edit Playlist wants.
          */
         val customUserAgent: String? = null,
+        /**
+         * A new row's id when the caller has one: a device setup keeps the
+         * sender's playlist id so both devices hold one playlist (Logan
+         * 2026-11-10). Ignored for an edit, and when a row already has it.
+         */
+        val newId: String? = null,
     )
 
     /**
@@ -518,6 +524,7 @@ class PlaylistRepository @Inject constructor(
             customUserAgent = request.customUserAgent ?: previous.customUserAgent,
         )
         dao.update(updated)
+        com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Playlists, existingId)
         // A changed User-Agent has to apply to the NEXT request, not the next
         // launch: the client keeps a per-host override cache and PlaybackHeaders
         // reads the row, so reseeding the cache is the whole of it.
@@ -627,7 +634,9 @@ class PlaylistRepository @Inject constructor(
         // Generate the playlist id up front so the JWT pair from a UserPass login
         // can land in DispatcharrTokenStore under the same key the rest of the
         // flow uses (refresh, warmup, silent rebootstrap on subsequent 401s).
-        val playlistId = existingId ?: UUID.randomUUID().toString()
+        val playlistId = existingId
+            ?: request.newId?.trim()?.takeIf { it.isNotEmpty() && dao.byId(it) == null }
+            ?: UUID.randomUUID().toString()
 
         // Did this EDIT swap the account the playlist connects as?
         //
@@ -781,7 +790,15 @@ class PlaylistRepository @Inject constructor(
                 sourceType == SourceType.DispatcharrUserPass
             ) {
                 resolvedApiKey?.takeIf { it.isNotBlank() }
-                    ?.let { dispatcharrClient.fetchCurrentUserProfileIds(normalisedBase, it) }
+                    // Best effort, as before: a 401 here is left to the channel
+                    // fetch below, which re-signs in from saved credentials.
+                    ?.let { k ->
+                        try {
+                            dispatcharrClient.fetchCurrentUserProfileIds(normalisedBase, k)
+                        } catch (u: com.aeriotv.android.core.network.DispatcharrError.Unauthorized) {
+                            null
+                        }
+                    }
                     ?: emptyList()
             } else {
                 emptyList()
@@ -987,6 +1004,10 @@ class PlaylistRepository @Inject constructor(
         } else {
             dao.upsert(entity)
         }
+        // Sync (Logan 2026-11-10): this save is the newest change to the
+        // playlist here, and to its sign-in when that was entered.
+        com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Playlists, entity.id)
+        if (priorRow == null || credentialsChanged) com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, entity.id)
         // Cache the first-load channels so the very next launch is instant
         // (Phase 130 channel snapshot cache).
         try {
@@ -1506,8 +1527,19 @@ class PlaylistRepository @Inject constructor(
             if (sourceType == SourceType.DispatcharrApiKey ||
                 sourceType == SourceType.DispatcharrUserPass
             ) {
-                playlist.apiKey?.takeIf { it.isNotBlank() }
-                    ?.let { dispatcharrClient.fetchCurrentUserProfileIds(base, it) }
+                // Through the key broker: this is the first call of every
+                // refresh, so a rotated key re-signs in here (password
+                // playlists) or starts the hold, instead of spending a
+                // counted failed-key attempt that nothing acts on.
+                if (playlist.apiKey.isNullOrBlank()) null else try {
+                    dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                        dispatcharrClient.fetchCurrentUserProfileIds(base, k)
+                    }
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    null
+                }
             } else {
                 null
             }
@@ -3860,6 +3892,8 @@ class PlaylistRepository @Inject constructor(
         // suspension point.
         DeletedPlaylists.mark(playlistId)
         cancelPlaylistTasks(playlistId)
+        // Sync tombstone: no older copy elsewhere brings the playlist back.
+        com.aeriotv.android.core.sync.SyncStamps.removed(com.aeriotv.android.core.sync.SyncStamps.Cat.Playlists, playlistId)
         // Drop any in-memory JWT pair for the row we're removing so the
         // warmup coordinator stops trying to refresh a dead playlist on
         // the next foreground.

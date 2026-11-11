@@ -26,10 +26,22 @@ import io.ktor.util.AttributeKey
  */
 internal val DispatcharrGatePlugin = createClientPlugin("DispatcharrGate") {
     on(Send) { request ->
+        // Launch: the Drive credentials pull goes first (bounded wait).
+        DispatcharrLaunchGate.await()
         val built = request.url.build()
         val path = built.encodedPath
         val isTokenEndpoint = path.contains("/api/accounts/token/")
         val server = DispatcharrRequestGate.serverKey(built.toString())
+        // Built with a key a re-sign-in has since replaced: send the current
+        // one (never logged), not a counted failure on a dead key.
+        requestApiKey(request.headers["X-API-Key"], request.headers["Authorization"])
+            ?.let { old -> DispatcharrRequestGate.replacementFor(old)?.let { old to it } }
+            ?.let { (old, new) ->
+                val (x, auth) = swappedAuthHeaders(request.headers["X-API-Key"], request.headers["Authorization"], old, new)
+                x?.let { request.headers["X-API-Key"] = it }
+                auth?.let { request.headers["Authorization"] = it }
+                Log.i(TAG, "[AUTH] ${request.method.value} $path: sent with the re-issued key")
+            }
         if (!request.attributes.contains(BypassKeyGate)) {
             val key = requestApiKey(request.headers["X-API-Key"], request.headers["Authorization"])
             if (key != null && DispatcharrRequestGate.isKeyRejected(key)) {
@@ -40,8 +52,9 @@ internal val DispatcharrGatePlugin = createClientPlugin("DispatcharrGate") {
         if (!isTokenEndpoint) {
             val left = DispatcharrRequestGate.pausedSeconds(server)
             if (left > 0) {
-                Log.i(TAG, "[RATE] skipped ${request.method.value} $path: server paused after a 429, ${left}s left")
-                throw DispatcharrError.RateLimited(left)
+                val reason = DispatcharrRequestGate.pausedReason(server)
+                Log.i(TAG, "[RATE] skipped ${request.method.value} $path: server paused after a 429 ($reason), ${left}s left")
+                throw DispatcharrError.RateLimited(left, reason)
             }
         }
         val call = proceed(request)
@@ -50,14 +63,15 @@ internal val DispatcharrGatePlugin = createClientPlugin("DispatcharrGate") {
             val secs = DispatcharrRequestGate.parseRetryAfter(retryAfterRaw)
             val serverHeader = call.response.headers["Server"]
             val body = runCatching { call.response.bodyAsText().take(200) }.getOrDefault("")
+            val reason = rateLimitReasonOf(body)
             Log.w(
                 TAG,
-                "[RATE] HTTP 429 for ${request.method.value} $path: Retry-After=${retryAfterRaw ?: "none"} " +
+                "[RATE] HTTP 429 for ${request.method.value} $path: reason=$reason Retry-After=${retryAfterRaw ?: "none"} " +
                     "(waiting ${secs}s) Server=${serverHeader ?: "none"} body=" +
                     LogSanitizer.redact(body.replace('\n', ' ')),
             )
-            DispatcharrRequestGate.pause(server, secs)
-            throw DispatcharrError.RateLimited(secs)
+            DispatcharrRequestGate.pause(server, secs, reason)
+            throw DispatcharrError.RateLimited(secs, reason)
         }
         call
     }
@@ -65,6 +79,21 @@ internal val DispatcharrGatePlugin = createClientPlugin("DispatcharrGate") {
 
 /** Set on an explicit key check (verifyConnection, Edit Playlist, the setup sender) so a rejected key can be tried again on purpose. */
 internal val BypassKeyGate = AttributeKey<Boolean>("DispatcharrBypassKeyGate")
+
+/**
+ * New values for the auth headers that carry [old]: X-API-Key, and an
+ * `ApiKey` or `Bearer` Authorization with the same scheme. Null = leave that
+ * header as it is (absent, or carrying something else such as a JWT).
+ */
+internal fun swappedAuthHeaders(xApiKey: String?, authorization: String?, old: String, new: String): Pair<String?, String?> {
+    val o = old.trim()
+    val x = xApiKey?.takeIf { it.trim() == o }?.let { new }
+    val parts = authorization?.trim()?.split(Regex("\\s+"), limit = 2)
+    val auth = if (parts != null && parts.size == 2 && parts[1] == o &&
+        (parts[0].equals("ApiKey", true) || parts[0].equals("Bearer", true))
+    ) "${parts[0]} $new" else null
+    return x to auth
+}
 
 /** The API key a request carries: X-API-Key, else `Authorization: ApiKey <k>` or `Bearer <k>`. */
 internal fun requestApiKey(xApiKey: String?, authorization: String?): String? {
