@@ -209,6 +209,7 @@ class DispatcharrClient @Inject constructor() {
      * are configured, so we drop down to OkHttp directly for this one call.
      */
     private val noRedirectOkHttp: OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(HeldRouteGate.interceptor)
         .followRedirects(false)
         .followSslRedirects(false)
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -228,7 +229,13 @@ class DispatcharrClient @Inject constructor() {
      * host that 200s with HTML), and [DispatcharrError.Transport] on every other
      * network or HTTP failure.
      */
-    suspend fun login(baseUrl: String, username: String, password: String): JwtPair {
+    suspend fun login(
+        baseUrl: String,
+        username: String,
+        password: String,
+        /** The held sign-in form: may reach a held Child's playlist (item 8). */
+        childSealBypass: Boolean = false,
+    ): JwtPair {
         // A 429 earlier in the throttle window: do not spend another attempt
         // (each one re-arms nothing but still counts against the user's IP).
         DispatcharrLoginGate.serverParkedSeconds(baseUrl).takeIf { it > 0 }?.let { left ->
@@ -242,6 +249,7 @@ class DispatcharrClient @Inject constructor() {
                 accept(ContentType.Application.Json)
                 header("User-Agent", userAgentForUrl(baseUrl))
                 setBody(LoginRequest(username = username, password = password))
+                if (childSealBypass) attributes.put(BypassChildSeal, true)
             }
         } catch (t: Throwable) {
             throw DispatcharrError.Transport(
@@ -345,13 +353,19 @@ class DispatcharrClient @Inject constructor() {
      * stable X-API-Key path. Mirrors iOS DispatcharrAPI.fetchCurrentUser
      * (DispatcharrDirectConnect.swift line 421-435).
      */
-    suspend fun fetchCurrentUserApiKey(baseUrl: String, accessToken: String): String {
+    suspend fun fetchCurrentUserApiKey(baseUrl: String, accessToken: String, childSealBypass: Boolean = false): String {
         val response: HttpResponse = try {
             client.get("${baseUrl.trimEnd('/')}/api/accounts/users/me/") {
                 accept(ContentType.Application.Json)
                 header("Authorization", "Bearer $accessToken")
                 header("User-Agent", userAgentForUrl(baseUrl))
+                if (childSealBypass) attributes.put(BypassChildSeal, true)
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: DispatcharrError) {
+            // The request gate's own answer (a 429 pause): keep its type and copy.
+            throw e
         } catch (t: Throwable) {
             throw DispatcharrError.Transport(
                 "Couldn't read user profile: ${t.message ?: t::class.simpleName}",
@@ -376,7 +390,7 @@ class DispatcharrClient @Inject constructor() {
         // api_key-minting path carry none (Discord 2026-08-16). Name the
         // fix instead of the generic "unexpected shape" copy.
         return me.apiKey?.takeIf { it.isNotBlank() }
-            ?: throw DispatcharrError.UnexpectedResponse(
+            ?: throw DispatcharrError.NoApiKey(
                 "The Dispatcharr account '${me.username}' has no API key. In " +
                     "Dispatcharr, open System, then Users, edit this user, and " +
                     "generate an API key, then try again.",
@@ -469,10 +483,43 @@ class DispatcharrClient @Inject constructor() {
         KeyCheck.Unknown(null)
     }
 
+    /** Outcome of [checkMe]. */
+    sealed interface MeCheck {
+        data class Ok(val me: MeResponse) : MeCheck
+        /** 401/403, or a key the gate already holds as rejected (nothing sent). */
+        data object Rejected : MeCheck
+        /** No answer: a network error, a 429 pause, or any other status. */
+        data object Unreachable : MeCheck
+    }
+
+    /**
+     * The same-server check after a playlist's address changed (A-APP-1):
+     * one GET of /api/accounts/users/me/ (already in the README path tables)
+     * at exactly [baseUrl] with exactly [apiKey], through the request gate.
+     * Unlike [fetchMe] it tells a refused key from no answer.
+     */
+    suspend fun checkMe(baseUrl: String, apiKey: String): MeCheck = try {
+        val response = client.get("${baseUrl.trimEnd('/')}/api/accounts/users/me/") { applyAuth(apiKey); attributes.put(BypassChildSeal, true) }
+        when (response.status.value) {
+            in 200..299 -> runCatching { MeCheck.Ok(response.body<MeResponse>()) }.getOrElse { MeCheck.Unreachable }
+            401, 403 -> MeCheck.Rejected
+            else -> MeCheck.Unreachable
+        }
+    } catch (c: kotlinx.coroutines.CancellationException) {
+        throw c
+    } catch (k: DispatcharrError.KeyRejected) {
+        MeCheck.Rejected
+    } catch (t: Throwable) {
+        MeCheck.Unreachable
+    }
+
     /** Profiles: the full /api/accounts/users/me/ record for the user [apiKey]
      *  authenticates as, or null on any failure. */
-    suspend fun fetchMe(baseUrl: String, apiKey: String): MeResponse? = runCatching {
-        val response = client.get("${baseUrl.trimEnd('/')}/api/accounts/users/me/") { applyAuth(apiKey) }
+    suspend fun fetchMe(baseUrl: String, apiKey: String, childSealBypass: Boolean = false): MeResponse? = runCatching {
+        val response = client.get("${baseUrl.trimEnd('/')}/api/accounts/users/me/") {
+            applyAuth(apiKey)
+            if (childSealBypass) attributes.put(BypassChildSeal, true)
+        }
         if (!response.status.isSuccess()) return@runCatching null
         response.body<MeResponse>()
     }.getOrNull()
@@ -654,6 +701,8 @@ class DispatcharrClient @Inject constructor() {
         /** custom_properties, verbatim, as JSON text ("" when absent). */
         val customPropertiesJson: String,
         val channelProfiles: List<Int>,
+        /** The Dispatcharr user id (the same-server check's identity, with [username]). */
+        val userId: Int = 0,
     )
 
     /**
@@ -696,6 +745,7 @@ class DispatcharrClient @Inject constructor() {
             isSuperuser = me.isSuperuser,
             customPropertiesJson = me.customProperties?.toString().orEmpty(),
             channelProfiles = me.channelProfiles,
+            userId = me.id,
         )
     }.orNullKeepingAuthFailures()
 

@@ -156,6 +156,8 @@ class PlaylistViewModel @Inject constructor(
         val selectedGroup: String = ALL_GROUPS,
         val sortMode: SortMode = SortMode.ByNumber,
         val isLoading: Boolean = false,
+        /** Launch with no cached channels while the active Child is held ([HeldListCopy]): the line Setting Up shows as it stays. */
+        val bootstrapLine: String? = null,
         /** Add Playlist while a 429 counts down: "The server is busy. Trying again in N seconds." */
         val busyMessage: String? = null,
         val error: String? = null,
@@ -941,6 +943,7 @@ class PlaylistViewModel @Inject constructor(
                             channels = if (kept) it.channels else channels,
                             isLoading = false,
                             error = null,
+                            bootstrapLine = null,
                         )
                     }
                     // First time we have channels, kick the EPG load now (if
@@ -962,6 +965,11 @@ class PlaylistViewModel @Inject constructor(
                         // unreachable right now.
                         Log.w(TAG, "channel refresh failed; cached rail still visible", t)
                         _state.update { it.copy(isLoading = false) }
+                    } else if (!HeldListCopy.launchGoesToAdd(heldHere(saved))) {
+                        // A held Child (its playlist moved, no same-server check
+                        // yet) stays here with the line, never the add-playlist screen.
+                        Log.w(TAG, "[PROFILE-HOST] channel refresh refused: the active profile is held at this address; staying")
+                        _state.update { it.copy(isLoading = false, error = HeldListCopy.LINE, bootstrapLine = HeldListCopy.LINE) }
                     } else {
                         _state.update {
                             it.copy(
@@ -2403,13 +2411,12 @@ class PlaylistViewModel @Inject constructor(
                 },
                 onFailure = { t ->
                     Log.w(TAG, "refreshPlaylist failed", t)
+                    val line = HeldListCopy.refreshFailed(heldHere(active), LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error"))
                     _state.update {
                         it.copy(
                             isLoading = false,
-                            playlistRefreshStatus = ActionStatus.Failure(
-                                "Refresh failed: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
-                            ),
-                            error = "Refresh failed: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
+                            playlistRefreshStatus = ActionStatus.Failure(line),
+                            error = line,
                         )
                     }
                 },
@@ -2523,13 +2530,12 @@ class PlaylistViewModel @Inject constructor(
                 },
                 onFailure = { t ->
                     Log.w(TAG, "refreshEverything failed", t)
+                    val line = HeldListCopy.refreshFailed(heldHere(active), LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error"))
                     _state.update {
                         it.copy(
                             isLoading = false,
-                            refreshAllStatus = ActionStatus.Failure(
-                                "Refresh failed: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
-                            ),
-                            error = "Refresh failed: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
+                            refreshAllStatus = ActionStatus.Failure(line),
+                            error = line,
                         )
                     }
                 },
@@ -2616,6 +2622,18 @@ class PlaylistViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Item 13 (Apple parity): the row whose sign-in Edit Playlist shows and
+     * edits, the playlist's OWN (the default profile's), whatever profile is
+     * active.
+     */
+    suspend fun ownSignInRow(playlistId: String): PlaylistEntity? = profileManager.defaultPlaylistRow(playlistId)
+
+    /** The active Child is held at [p]'s address after a server change: every request there is refused ([HeldListCopy]). */
+    private fun heldHere(p: PlaylistEntity): Boolean =
+        com.aeriotv.android.core.profiles.ProfileScope.isSealedRoute(p.urlString) ||
+            p.lanUrlString?.takeIf { it.isNotBlank() }?.let { com.aeriotv.android.core.profiles.ProfileScope.isSealedRoute(it) } == true
+
     /** The playlist Edit Playlist is editing: [playlistId] when given, else the active one. */
     private suspend fun editTarget(playlistId: String?): PlaylistEntity? =
         playlistId?.let { repository.playlistById(it) } ?: repository.activePlaylist()
@@ -2681,7 +2699,7 @@ class PlaylistViewModel @Inject constructor(
             val sourceType = sourceTypeOverride
                 ?: SourceType.entries.firstOrNull { it.name == active.sourceType }
                 ?: SourceType.M3uUrl
-            val request = PlaylistRepository.SaveRequest(
+            val typedRequest = PlaylistRepository.SaveRequest(
                 sourceType = sourceType,
                 name = name.ifBlank { null },
                 // Scheme-normalize all three URLs so the user can type
@@ -2698,18 +2716,57 @@ class PlaylistViewModel @Inject constructor(
                 epgRetentionDays = sanitizeGuideDays(epgRetentionDays),
                 customUserAgent = customUserAgent,
             )
+            // Item 13 (Apple parity): the form edits the playlist's OWN sign-in.
+            // With a non-default profile active on this playlist (not held, and
+            // the address stays), the rest of the edit saves as that profile
+            // with its current sign-in, unchanged, so its channels and session
+            // stay its own; the playlist's own sign-in is checked first and
+            // written to the playlist's own row after. Any other save runs on
+            // the playlist's own row with no per-profile diversion.
+            val profileOverlay = com.aeriotv.android.core.profiles.ProfileScope.overlayFor(active.id)
+                ?.takeIf { it.profileId !in com.aeriotv.android.core.profiles.ProfileScope.held }
+            val asProfile = com.aeriotv.android.core.profiles.EditPlaylistSignIn.savesAsProfile(
+                isActivePlaylist = active.isActive,
+                profileInstalled = profileOverlay != null,
+                routeChanged = com.aeriotv.android.core.profiles.ProfileHostHold.routeChanged(
+                    active.urlString, typedRequest.url, active.lanUrlString, typedRequest.lanUrl,
+                ),
+            )
+            val ownSignIn = if (asProfile) {
+                try {
+                    repository.verifyOwnSignIn(active.id, typedRequest)
+                } catch (c: kotlinx.coroutines.CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    Log.w(TAG, "saveEdits: the playlist's own sign-in was not accepted (${t.javaClass.simpleName})")
+                    _saveStage.value = null
+                    _saveHasProgress.value = false
+                    onResult?.invoke(loadFailureMessage("Save failed", t))
+                    return@launch
+                }
+            } else null
+            val forSave = com.aeriotv.android.core.profiles.EditPlaylistSignIn.forSave(
+                typed = com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(typedRequest.apiKey, typedRequest.username, typedRequest.password),
+                profile = profileOverlay?.let { com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(it.apiKey, it.username, it.password) },
+                asProfile = asProfile,
+            )
+            val request = typedRequest.copy(apiKey = forSave.apiKey, username = forSave.username, password = forSave.password)
+            // Raw rows in and out (no diversion into a profile) unless the save runs as the active profile.
+            val rowScope: kotlin.coroutines.CoroutineContext =
+                if (asProfile) kotlin.coroutines.EmptyCoroutineContext else com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()
             // What does this edit actually need? A rename, a User-Agent, a LAN
             // URL, an EPG URL, Guide Days or the On Demand toggle change nothing
             // about which channels exist, so they take the instant path: one row
             // UPDATE, no login, no 650-channel fetch, no capability probe, no
             // loading screen. Apple has always worked this way; here the rename
             // was costing 9 to 11 s (Logan, measured 2026-09-18).
-            val editPlan = repository.classifyEdit(request, active.id)
+            val editPlan = withContext(rowScope) { repository.classifyEdit(request, active.id) }
             if (editPlan != null && editPlan.instant) {
                 _saveHasProgress.value = false
                 _saveStage.value = null
-                repository.applyInstantEdit(request, active.id, editPlan).fold(
+                withContext(rowScope) { repository.applyInstantEdit(request, active.id, editPlan) }.fold(
                     onSuccess = { entity ->
+                        ownSignIn?.let { repository.writeOwnSignIn(active.id, it) }
                         if (!entity.isActive) {
                             onResult?.invoke(null)
                             return@fold
@@ -2741,12 +2798,14 @@ class PlaylistViewModel @Inject constructor(
                 // Non-active playlist: the network save runs, but the active
                 // session's UiState (playlist, channels, guide, VOD) is left
                 // alone because none of it belongs to this row.
-                repository.loadAndPersist(
-                    request,
-                    existingId = active.id,
-                    onStage = { stage -> _saveStage.value = stage },
-                    onPlan = { plan -> _savePlan.value = plan },
-                ).fold(
+                withContext(rowScope) {
+                    repository.loadAndPersist(
+                        request,
+                        existingId = active.id,
+                        onStage = { stage -> _saveStage.value = stage },
+                        onPlan = { plan -> _savePlan.value = plan },
+                    )
+                }.fold(
                     onSuccess = {
                         _saveStage.value = null
                         _saveHasProgress.value = false
@@ -2762,6 +2821,14 @@ class PlaylistViewModel @Inject constructor(
                 return@launch
             }
             _state.update { it.copy(isLoading = true, error = null) }
+            // A new address while a non-default profile is active (A-APP-1):
+            // that profile is held from now on, so this interim row (the guide
+            // may fetch with it before the save lands) carries the playlist's
+            // own sign-in, as typed over the stored one.
+            val own = if (
+                com.aeriotv.android.core.profiles.ProfileHostHold.routeChanged(active.urlString, request.url, active.lanUrlString, request.lanUrl) &&
+                profileManager.activeProfile(active.id)?.isDefault == false
+            ) profileManager.defaultPlaylistRow(active.id) else null
             // GH #83: Edit Playlist reads state.playlist, so reflect the
             // edited fields there NOW (the repository writes the DB row early
             // too); a failed save puts the previous values back.
@@ -2773,9 +2840,9 @@ class PlaylistViewModel @Inject constructor(
                         urlString = request.url.trimEnd('/'),
                         lanUrlString = request.lanUrl?.trimEnd('/'),
                         epgUrl = request.epgUrl,
-                        apiKey = request.apiKey ?: active.apiKey,
-                        username = request.username,
-                        password = request.password,
+                        apiKey = if (own != null) request.apiKey ?: own.apiKey else request.apiKey ?: active.apiKey,
+                        username = if (own != null) request.username ?: own.username else request.username,
+                        password = if (own != null) request.password ?: own.password else request.password,
                         dispatcharrProfileId = request.dispatcharrProfileId,
                         vodEnabled = request.vodEnabled,
                         epgRetentionDays = request.epgRetentionDays,
@@ -2783,13 +2850,16 @@ class PlaylistViewModel @Inject constructor(
                     ),
                 )
             }
-            repository.loadAndPersist(
-                request,
-                existingId = active.id,
-                onStage = { stage -> _saveStage.value = stage },
-                onPlan = { plan -> _savePlan.value = plan },
-            ).fold(
+            withContext(rowScope) {
+                repository.loadAndPersist(
+                    request,
+                    existingId = active.id,
+                    onStage = { stage -> _saveStage.value = stage },
+                    onPlan = { plan -> _savePlan.value = plan },
+                )
+            }.fold(
                 onSuccess = { (entity, channels) ->
+                    ownSignIn?.let { repository.writeOwnSignIn(active.id, it) }
                     _state.update {
                         it.copy(
                             playlist = entity,

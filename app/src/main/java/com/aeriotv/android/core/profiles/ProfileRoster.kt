@@ -3,6 +3,27 @@ package com.aeriotv.android.core.profiles
 import com.aeriotv.android.core.sync.dsync.ProfileRow
 
 /**
+ * Profiles added from the synced roster in this process, whose undo (the
+ * onboarding Remove, or Cancel on "PIN Required") is local only with no
+ * tombstone (item 5). A profile added during a roster pause joins once the
+ * first pull after the pause gives it its roster row; one that finds no row
+ * stays a plain add. Pure.
+ */
+class RosterAdds {
+    private val ids = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    fun addedFromRoster(profileId: String) { ids += profileId }
+
+    /** A profile added during the pause met the roster: with its row ([tookRow]) it is a roster add from now on. */
+    fun pauseAddMerged(profileId: String, tookRow: Boolean) { if (tookRow) ids += profileId }
+
+    fun forget(profileId: String) { ids -= profileId }
+
+    /** Undoing [profileId]'s add leaves no tombstone: a roster add, or a pause add that has not met the roster yet ([stillPausedAdd]). */
+    fun undoIsLocalOnly(profileId: String, stillPausedAdd: Boolean): Boolean = profileId in ids || stillPausedAdd
+}
+
+/**
  * The synced `profiles` list is a catalog of available profiles, not a
  * mandate (owner decision 2026-10-27): a pull merges metadata into profiles
  * this device already has and never creates one. Rows for users with no
@@ -28,6 +49,37 @@ object ProfileRoster {
         plan(rows, localUsernames).available
             .distinctBy { it.username.lowercase() }
             .sortedWith(compareBy<ProfileRow> { if (it.order >= 0) it.order else Int.MAX_VALUE }.thenBy { it.username.lowercase() })
+
+    /**
+     * A manual add ("Enter details", or an API key) of [username]: the synced
+     * roster row offered for that user under "From your other devices" (the
+     * same case-insensitive match the suggestions use), or null when there is
+     * none and the add is a plain one. A user already on this device has no
+     * suggestion, so no row.
+     */
+    fun rowForManualAdd(rows: List<ProfileRow>, localUsernames: Collection<String>, username: String): ProfileRow? {
+        val name = username.trim().lowercase()
+        if (name.isEmpty()) return null
+        return suggestions(rows, localUsernames).firstOrNull { it.username.lowercase() == name }
+    }
+
+    /**
+     * Undoing a fresh add (the onboarding Remove, or Cancel on the "PIN
+     * Required" step after an add while a Child exists): a roster add,
+     * including a manual add that finished as one, is removed on this device
+     * only, with no tombstone, so its row stays on the server and is offered
+     * again under "From your other devices". A plain add keeps the tombstone
+     * it always had (its row exists only because this device pushed it).
+     */
+    fun undoWritesTombstone(rosterAdd: Boolean): Boolean = !rosterAdd
+
+    /**
+     * The stamp an add reports to Dispatcharr Sync: a roster add keeps the
+     * row's own `updatedAt`, so the server row stays the newest for every
+     * field this device did not change; 0 means now (a plain add, or a row
+     * from an older writer with no stamp).
+     */
+    fun addStampAt(seed: ProfileRow?): Long = seed?.updatedAt?.takeIf { it > 0 } ?: 0L
 
     /**
      * The row's display name, role, order, and avatar on [p]. Absent fields

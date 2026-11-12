@@ -79,6 +79,15 @@ class ProfileManager @Inject constructor(
     private val mutex = Mutex()
     @Volatile private var started = false
 
+    /** Server address changes (A-APP-1): held profile sign-ins, persisted before anything is sent. */
+    private val hostHolds = HostHoldBook(
+        object : HostHoldBook.Backing {
+            private val prefs = context.getSharedPreferences("aerio_profile_host", android.content.Context.MODE_PRIVATE)
+            override fun read(): String? = prefs.getString("state.v1", null)
+            override fun write(value: String) { prefs.edit().putString("state.v1", value).commit() }
+        },
+    )
+
     /** Playlist ids whose channel list / groups / VOD must reload after a
      *  profile switch. A Channel so exactly one PlaylistViewModel handles it. */
     data class Reload(val playlistId: String, val gen: Long, val fromSwitch: Boolean = true)
@@ -142,6 +151,12 @@ class ProfileManager @Inject constructor(
      * scoped read ever sees the default profile's state by mistake.
      */
     fun restoreSync() {
+        // First: a sign-in held after a server address change never goes out
+        // after a relaunch, whatever was active when the app stopped, and
+        // those playlists' roster sync stays paused.
+        ProfileScope.held = hostHolds.heldProfileIds()
+        _rosterPaused.value = hostHolds.pausedPlaylists()
+        _rosterPaused.value.forEach { Log.i(TAG, "[PROFILE-HOST] roster sync paused playlist=${it.take(8)}") }
         ProfileScope.onOverlayChanged = { o -> store.update(o.profileId) { it.withOverlay(o) } }
         ProfileScope.activeUserIdLookup = { pid -> activeProfileIdNow(pid)?.let(store::byId)?.userId ?: 0 }
         scope.launch {
@@ -153,8 +168,25 @@ class ProfileManager @Inject constructor(
             }
         }
         val pid = store.lastActivePlaylistId ?: return
+        var active = store.activeProfileId(pid)?.let(store::byId)
+        // Held, or with no stored sign-in (treated the same, 2026-11-11).
+        if (active != null && !active.isDefault && unusable(active.id)) {
+            if (ProfileHostHold.staysActiveWhenHeld(active.effectiveRole())) {
+                // A held Child stays active (no reset to the default, so no
+                // launch picker either), sending nothing until the hold lifts.
+                val held = hostHolds.isHeld(active.id)
+                val row = if (held) null else rawRowBlocking(pid)
+                seal(active.id, hostHolds.hold(pid)?.current?.takeIf { it.isNotEmpty() }
+                    ?: row?.let { ProfileHostHold.routes(it.urlString, it.lanUrlString) }.orEmpty())
+                if (!held) openNoSignInForm(pid, active.id, row?.name.orEmpty())
+                Log.i(TAG, "[PROFILE-HOST] restored the ${if (held) "held" else "signed-out"} Child on ${pid.take(8)}; it stays until it signs in, the hold lifts, or a PIN switch")
+            } else {
+                store.setActiveProfileId(pid, null)
+                Log.i(TAG, "[PROFILE-HOST] restored the default profile on ${pid.take(8)}: the active profile's sign-in is held or missing")
+                active = null
+            }
+        }
         refreshActiveRole(pid)
-        val active = store.activeProfileId(pid)?.let(store::byId)
         if (active != null && !active.isDefault && active.playlistId == pid) {
             ProfileScope.activate(active.toOverlay())
             Log.i(TAG, "[PROFILE] restored ${active.displayName} on ${pid.take(8)}")
@@ -218,7 +250,7 @@ class ProfileManager @Inject constructor(
     suspend fun pickAtLaunch(profileId: String): Result<Unit> {
         val pk = _launchPicker.value ?: return Result.success(Unit)
         if (pinStore.hasPin(profileId) && !switchTickets.contains(profileId)) return Result.failure(IllegalStateException("Enter PIN"))
-        if (profileId == activeProfileIdNow(pk.playlistId)) {
+        if (profileId == activeProfileIdNow(pk.playlistId) && !unusable(profileId)) {
             switchTickets.remove(profileId)
             _launchPicker.value = null
             releaseLaunchHoldIfClear()
@@ -298,15 +330,34 @@ class ProfileManager @Inject constructor(
     fun needsPinAfterAdd(playlistId: String, profileId: String): Boolean =
         anyChild(playlistId) && RoleRules.isFullAccess(roleOf(profileId)) && !pinStore.hasPin(profileId)
 
-    /** The PIN step after an add was cancelled: the add is undone (a Child exists, so a PIN is required). */
-    suspend fun discardPendingAdds(playlistId: String) {
-        val drop = store.forPlaylist(playlistId).filter { it.id in pendingPinAdds && !pinStore.hasPin(it.id) && !it.isDefault }
+    /**
+     * The PIN step after an add was cancelled: the adds [addedInAction] made
+     * are undone (a Child exists, so a PIN is required). Profiles other
+     * actions added, a setup handoff's included, stay pending as they were.
+     */
+    suspend fun discardPendingAdds(playlistId: String, addedInAction: Collection<String>) {
+        val ids = RoleRules.pinStepCancelDiscards(addedInAction, pendingPinAdds, pinStore::hasPin).toSet()
+        val drop = store.forPlaylist(playlistId).filter { it.id in ids && !it.isDefault }
         drop.forEach { p ->
             pendingPinAdds.remove(p.id)
-            deleteLocal(p, fromSync = false)
-            Log.i(TAG, "[PROFILE] add of ${p.username} undone: no PIN while a Child exists")
+            // A roster add goes on this device only, so it is offered again.
+            val rosterAdd = undoesRosterAdd(p.id)
+            deleteLocal(p, fromSync = false, tombstone = ProfileRoster.undoWritesTombstone(rosterAdd))
+            freshUndoable.remove(p.id)
+            rosterUndoable.update { it - p.id }
+            Log.i(TAG, "[PROFILE] add of ${p.username} undone: no PIN while a Child exists${if (rosterAdd) " (roster add: this device only)" else ""}")
         }
     }
+
+    /** Profiles added from the synced roster in this process (a roster add, a manual add that finished as one, or a pause add that took its row). */
+    private val rosterAdds = RosterAdds()
+
+    /**
+     * Undoing [profileId]'s add leaves no tombstone: it came from the roster,
+     * or it was added during a roster pause and could not tell (a tombstone
+     * then could delete that user's row everywhere once the pause ends).
+     */
+    private fun undoesRosterAdd(profileId: String): Boolean = rosterAdds.undoIsLocalOnly(profileId, hostHolds.isPausedAdd(profileId))
 
     // ---- Device Admin PIN (device-local, never synced) ----
     // A PIN tied to no profile: set in onboarding when the first profile is a
@@ -655,6 +706,9 @@ class ProfileManager @Inject constructor(
                 }
             }
                 .onFailure { Log.w(TAG, "[PROFILE] migration pass failed", it) }
+            // Held playlists (a held Child may be active): the same-server check
+            // runs in the background with the default profile's sign-in.
+            hostHolds.pausedPlaylists().forEach { scheduleSameServerCheck(it) }
             // Per-profile settings (2026-10-27): seed existing profiles once from the global values.
             runCatching { appPreferences.seedExistingProfilesOnce(store.profiles.value.filterNot { it.isDefault }.map { it.id }) }
                 .onFailure { Log.w(TAG, "[PROFILE] settings seed pass failed", it) }
@@ -669,7 +723,20 @@ class ProfileManager @Inject constructor(
         if (pid == null) { ProfileScope.activate(null); ProfileRoles.set(null); return@withLock }
         store.lastActivePlaylistId = pid
         playlistDao.rawById(pid)?.let { ensureDefaultProfile(it) }
-        val active = store.activeProfileId(pid)?.let(store::byId)
+        var active = store.activeProfileId(pid)?.let(store::byId)
+        if (active != null && !active.isDefault && unusable(active.id)) {
+            if (ProfileHostHold.staysActiveWhenHeld(active.effectiveRole())) {
+                // A held Child (or one with no stored sign-in) stays, sending nothing to its playlist's addresses.
+                playlistDao.rawById(pid)?.let {
+                    seal(active!!.id, ProfileHostHold.routes(it.urlString, it.lanUrlString))
+                    openNoSignInForm(pid, active!!.id, it.name)
+                }
+            } else {
+                // Its sign-in is held after a server address change: the default profile it is.
+                store.setActiveProfileId(pid, null)
+                active = null
+            }
+        }
         val current = ProfileScope.activeOverlay()
         if (active != null && !active.isDefault) {
             if (current?.profileId != active.id) ProfileScope.activate(active.toOverlay())
@@ -700,8 +767,10 @@ class ProfileManager @Inject constructor(
             // API-key login: ask the server who the key belongs to.
             val key = row.apiKey
             if (!key.isNullOrBlank()) {
-                username = runCatching { client.fetchMe(repository.effectiveBaseUrl(row), key)?.username }
-                    .getOrNull().orEmpty()
+                val base = repository.effectiveBaseUrl(row)
+                val me = runCatching { client.fetchMe(base, key) }.getOrNull()
+                me?.let { runCatching { noteDefaultMe(row.id, base, key, it.id, it.username) } }
+                username = me?.username.orEmpty()
             }
         }
         val seeded = seededDefaultIds.remove(row.id)?.takeIf { store.byId(it) == null }
@@ -775,8 +844,27 @@ class ProfileManager @Inject constructor(
         if (store.forPlaylist(playlistId).any { it.username.equals(name, ignoreCase = true) }) {
             return Result.failure(IllegalStateException("$name already has a profile."))
         }
+        rosterRowForManualAdd(playlistId, name)?.let { row ->
+            return addFromRoster(playlistId, row, DispatcharrUserSummary(id = 0, username = name), password, apiKey, fallbackRole = role)
+        }
         return addProfile(playlistId, DispatcharrUserSummary(id = 0, username = name), password, apiKey, role)
     }
+
+    /**
+     * A manual add of a user the synced roster already has (offered under
+     * "From your other devices") finishes as a roster add: the row's role,
+     * PIN, avatar, name, order, and stamp, with the credentials typed here. A
+     * plain add would stamp the row now with no PIN and the picked role, and
+     * the next push would drop that profile's PIN and Child role on every
+     * device. Null = a plain add.
+     */
+    private fun rosterRowForManualAdd(playlistId: String, username: String): com.aeriotv.android.core.sync.dsync.ProfileRow? =
+        ProfileRoster.rowForManualAdd(
+            RosterPause.visibleRows(_roster.value[playlistId].orEmpty(), hostHolds.isPaused(playlistId)),
+            store.forPlaylist(playlistId).map { it.username },
+            username,
+        )
+            ?.also { Log.i(TAG, "[DSYNC] profiles: manual add of ${it.username} is in the synced roster; finishing as a roster add") }
 
     /**
      * Manual add by API key only: GET /api/accounts/users/me/ with [apiKey]
@@ -793,6 +881,16 @@ class ProfileManager @Inject constructor(
             ?: return Result.failure(IllegalStateException("This API key was not accepted by the server."))
         if (store.forPlaylist(playlistId).any { it.username.equals(me.username, ignoreCase = true) }) {
             return Result.failure(IllegalStateException("${me.username} already has a profile."))
+        }
+        rosterRowForManualAdd(playlistId, me.username)?.let { row ->
+            return addFromRoster(
+                playlistId,
+                row,
+                DispatcharrUserSummary(id = me.id, username = me.username, userLevel = me.userLevel, isSuperuser = me.isSuperuser, isStaff = me.isStaff),
+                null,
+                key,
+                fallbackRole = role,
+            )
         }
         return addProfile(
             playlistId,
@@ -890,6 +988,17 @@ class ProfileManager @Inject constructor(
             // FIRST store write, so the row never exists (or syncs) half built.
             .let { if (seed != null) ProfileRoster.applyRow(it, seed) else it }
         store.upsert(profile)
+        if (seed != null) rosterAdds.addedFromRoster(id)
+        // Signed in just now at the playlist's current address: no older hold
+        // applies to this id, and its tag is the server it signed in at.
+        dropHold(id, "added")
+        runCatching { tagLive(playlistId, id, base) }
+        // Added while the roster sync is paused: it could not see the roster.
+        // The first pull after the pause applies its row, if there is one.
+        if (seed == null && hostHolds.isPaused(playlistId)) {
+            hostHolds.markPausedAdd(id)
+            Log.i(TAG, "[PROFILE-HOST] ${user.username} added during the roster pause on ${playlistId.take(8)}")
+        }
         if (needsPinAfterAdd(playlistId, id)) pendingPinAdds.add(id)
         appPreferences.seedProfileSettings(id)
         if (seed != null) {
@@ -898,7 +1007,7 @@ class ProfileManager @Inject constructor(
             }
             // Keep the row's own stamp: the server row stays authoritative
             // for every field this device did not change.
-            mutated(id, "roster-add", seed.updatedAt)
+            mutated(id, "roster-add", ProfileRoster.addStampAt(seed))
         } else {
             mutated(id, "add")
         }
@@ -961,6 +1070,13 @@ class ProfileManager @Inject constructor(
         removedAt: (String) -> Long = { 0L },
         customized: (String, String, AvatarSpec?) -> Boolean = { _, _, _ -> true },
     ): Int {
+        // Paused (a profile here is held after a server change): the server's
+        // rows, tombstones, and suggestions stay out. Sync never calls this
+        // while paused; this is the backstop.
+        if (hostHolds.isPaused(playlistId)) {
+            Log.i(TAG, "[PROFILE-HOST] roster rows not applied: roster sync paused playlist=${playlistId.take(8)}")
+            return 0
+        }
         publishRoster(playlistId, rows)
         val plan = ProfileRoster.plan(rows, store.forPlaylist(playlistId).map { it.username })
         Log.i(TAG, "[DSYNC] profiles: ${plan.available.size} roster rows available, not added (opt-in)")
@@ -973,6 +1089,9 @@ class ProfileManager @Inject constructor(
             // offered under "From your other devices" until chosen.
             if (local == null) return@forEach
             val id = local.id
+            // Added during a roster pause: it never saw this row, so it takes it
+            // now, row stamp and all, as a manual add of a roster user does.
+            val pausedAdd = hostHolds.isPausedAdd(id)
             if (local.userId == 0 && r.userId > 0) store.update(id) { it.copy(userId = r.userId) }
             val mine = localUpdatedAt(local.username)
             // No local claim on name/avatar (never renamed or given an avatar
@@ -983,7 +1102,7 @@ class ProfileManager @Inject constructor(
                 Log.i(TAG, "[DSYNC] profiles: adopted synced name/avatar for ${local.username}")
                 local = store.byId(id) ?: local
             }
-            val repair = ProfileRoster.repair(local.displayName, local.avatar, mine, r)
+            val repair = if (pausedAdd) ProfileRoster.Repair.None else ProfileRoster.repair(local.displayName, local.avatar, mine, r)
             if (repair == ProfileRoster.Repair.ResendLocal) {
                 Log.i(TAG, "[DSYNC] profiles: server row ${local.username} looks stripped; re-sending local")
                 mutated(id, "repair")
@@ -991,9 +1110,15 @@ class ProfileManager @Inject constructor(
             }
             if (repair == ProfileRoster.Repair.ApplyServer) {
                 Log.i(TAG, "[DSYNC] profiles: local row ${local.username} is stripped; applying server name/avatar")
-            } else if (!com.aeriotv.android.core.sync.dsync.DsyncGate.profileRowWins(mine, r)) {
+            } else if (!RosterPause.rowApplies(pausedAdd, mine, r)) {
                 Log.i(TAG, "[DSYNC] profiles: keep local row for ${local.username} (local $mine >= server ${r.updatedAt})")
                 return@forEach
+            }
+            if (pausedAdd) {
+                // It is a roster add from now on: undoing it (still possible
+                // in the onboarding step or the PIN step) leaves no tombstone.
+                rosterAdds.pauseAddMerged(id, tookRow = true)
+                Log.i(TAG, "[PROFILE-HOST] ${local.username} added during the roster pause takes its roster row")
             }
             if (r.displayName.isNotBlank() && r.displayName != local.displayName) {
                 store.update(id) { it.copy(displayName = r.displayName) }
@@ -1017,8 +1142,9 @@ class ProfileManager @Inject constructor(
             }
             val type = PinRules.typeFromWire(r.pinType)
             if (type == null) {
-                // A v1 PIN set on this device before sync stays until re-entered.
-                if (pinStore.hasPin(id) && !pinStore.isLegacy(id)) {
+                // A v1 PIN set on this device before sync stays until re-entered,
+                // and so does a PIN set right after an add during the pause.
+                if (!pausedAdd && pinStore.hasPin(id) && !pinStore.isLegacy(id)) {
                     pinStore.remove(id)
                     Log.i(TAG, "[DSYNC] profiles: pin removed for ${local.username} (server row newer)")
                 }
@@ -1027,6 +1153,12 @@ class ProfileManager @Inject constructor(
             }
             adopted(local.username, r.updatedAt)
         }
+        // Every profile added during the pause has now met the roster: one with
+        // a row took it above; one without stays a plain add.
+        // Settled only here, inside the merge of a pull that decoded the roster:
+        // sync never calls this for a failed, absent, or malformed read.
+        val marked = store.forPlaylist(playlistId).filter { hostHolds.isPausedAdd(it.id) }.map { it.id }
+        RosterPause.settledPauseAdds(marked, rows).forEach { hostHolds.clearPausedAdd(it) }
         refreshActiveRole()
         return added
     }
@@ -1043,8 +1175,11 @@ class ProfileManager @Inject constructor(
      * with Dispatcharr Sync off); updates when it does.
      */
     fun rosterSuggestions(playlistId: String): Flow<List<com.aeriotv.android.core.sync.dsync.ProfileRow>> =
-        combine(_roster, store.profiles) { r, local ->
-            ProfileRoster.suggestions(r[playlistId].orEmpty(), local.filter { it.playlistId == playlistId }.map { it.username })
+        combine(_roster, store.profiles, _rosterPaused) { r, local, paused ->
+            ProfileRoster.suggestions(
+                RosterPause.visibleRows(r[playlistId].orEmpty(), playlistId in paused),
+                local.filter { it.playlistId == playlistId }.map { it.username },
+            )
         }.distinctUntilChanged()
 
     /**
@@ -1061,8 +1196,10 @@ class ProfileManager @Inject constructor(
         apiKey: String?,
         /** A device setup keeps the sender's profile id. */
         wantedId: String? = null,
+        /** A manual add's picked role, for a row from an older writer that carries none. */
+        fallbackRole: ProfileRole? = null,
     ): Result<DispatcharrProfile> {
-        val role = ProfileRole.fromWire(row.role)
+        val role = ProfileRole.fromWire(row.role) ?: fallbackRole
         // One step: the row's fields and PIN are applied inside addProfile
         // before the sync hook fires (an applyRow after the add raced the push).
         val added = addProfile(playlistId, user, password, apiKey, role, seed = row, wantedId = wantedId).getOrElse { return Result.failure(it) }
@@ -1076,7 +1213,8 @@ class ProfileManager @Inject constructor(
 
     /** True when [profileId] has its own saved API key or password here (the default profile uses the playlist login). */
     fun hasSavedCredential(profileId: String): Boolean =
-        store.byId(profileId)?.let { it.isDefault || !it.apiKey.isNullOrBlank() || !it.password.isNullOrBlank() } ?: false
+        store.byId(profileId)?.let { ProfileHostHold.withoutHeldSignIn(it, hostHolds.isHeld(it.id)) }
+            ?.let { it.isDefault || !it.apiKey.isNullOrBlank() || !it.password.isNullOrBlank() } ?: false
 
     /** Sign in once as [profileId]'s user and save the password or key on that profile. */
     suspend fun saveProfileCredential(playlistId: String, profileId: String, password: String?, apiKey: String?): Result<Unit> = runCatching {
@@ -1090,6 +1228,7 @@ class ProfileManager @Inject constructor(
         val me = client.fetchMe(base, key) ?: error("Could not read ${p.username} from the server.")
         if (!me.username.equals(p.username, ignoreCase = true)) error("This API key belongs to ${me.username}, not ${p.username}.")
         store.update(profileId) { it.copy(password = password?.takeIf { s -> s.isNotBlank() } ?: it.password).applyMe(me, key) }
+        ownSignInRepaired(playlistId, profileId)
         Log.i(TAG, "[PROFILE] credential saved for ${p.username}")
     }
 
@@ -1099,7 +1238,8 @@ class ProfileManager @Inject constructor(
     suspend fun userQrText(playlistId: String, profileId: String): String? {
         val row = playlistDao.rawById(playlistId) ?: return null
         if (!row.sourceType.startsWith("Dispatcharr")) return null
-        val p = store.byId(profileId)?.takeIf { it.playlistId == playlistId } ?: return null
+        val p = store.byId(profileId)?.takeIf { it.playlistId == playlistId }
+            ?.let { ProfileHostHold.withoutHeldSignIn(it, hostHolds.isHeld(it.id)) } ?: return null
         val key = (if (p.isDefault) row.apiKey else p.apiKey)?.takeIf { it.isNotBlank() } ?: return null
         val user = p.username.ifBlank { row.username.orEmpty() }
         return com.aeriotv.android.core.qr.ScannedCode.userKeyText(key, row.urlString, user)
@@ -1139,14 +1279,32 @@ class ProfileManager @Inject constructor(
     fun canSetUpTv(playlistId: String): Boolean =
         RoleRules.isFullAccess(activeRole(playlistId)) || activeProfile(playlistId)?.isDefault != false
 
+    // ---- The account a playlist signs in as (item 11: same-account sign-ins) ----
+
+    /** The default profile's Dispatcharr username on [playlistId], or null. */
+    fun defaultProfileUsername(playlistId: String): String? =
+        store.forPlaylist(playlistId).firstOrNull { it.isDefault }?.username?.trim()?.takeIf { it.isNotEmpty() }
+
+    /** The default identity recorded for [playlistId] (users/me with the default sign-in; frozen while held), or null. */
+    fun recordedDefaultIdentity(playlistId: String): ProfileHostHold.Identity? = hostHolds.recorded(playlistId)
+
+    /** The active or the default profile on [playlistId] is a Child. */
+    fun childInvolved(playlistId: String): Boolean =
+        activeRole(playlistId) == ProfileRole.Child ||
+            store.forPlaylist(playlistId).firstOrNull { it.isDefault }?.effectiveRole() == ProfileRole.Child
+
     /** The playlist row with the DEFAULT profile's credential (never a switched profile's). */
     suspend fun defaultPlaylistRow(playlistId: String): PlaylistEntity? = playlistDao.rawById(playlistId)
+
+    /** Every playlist row with the DEFAULT profile's credential (Fix Login's card rule). */
+    suspend fun defaultPlaylistRows(): List<PlaylistEntity> = playlistDao.rawAll()
 
     /** A local profile plus its v2 PIN record, for the setup payload. */
     data class SetupSource(val profile: DispatcharrProfile, val pin: ProfilePinStore.Record?)
 
+    /** A held profile (server address changed) comes without its stored sign-in, so no payload carries it. */
     fun setupSources(playlistId: String): List<SetupSource> =
-        store.forPlaylist(playlistId).map { SetupSource(it, pinStore.syncRecord(it.id)) }
+        store.forPlaylist(playlistId).map { SetupSource(ProfileHostHold.withoutHeldSignIn(it, hostHolds.isHeld(it.id)), pinStore.syncRecord(it.id)) }
 
     /**
      * TV side: apply one handed-over profile. The default profile already
@@ -1303,6 +1461,9 @@ class ProfileManager @Inject constructor(
      * because this device pushed it, so its undo writes the tombstone.
      */
     fun markFreshAddUndoable(profileId: String) {
+        // A manual add that finished as a roster add is already undoable, and
+        // its undo must write no tombstone: the row is on the server.
+        if (profileId in rosterUndoable.value) return
         freshUndoable += profileId
         rosterUndoable.update { it + profileId }
     }
@@ -1326,8 +1487,8 @@ class ProfileManager @Inject constructor(
         check(profileId in rosterUndoable.value) { "Only a profile just added here can be undone." }
         val p = store.byId(profileId) ?: run { rosterUndoable.update { it - profileId }; return@runCatching }
         check(!p.isDefault) { "The default profile cannot be removed." }
-        val fresh = freshUndoable.remove(profileId)
-        deleteLocal(p, fromSync = false, tombstone = fresh)
+        freshUndoable.remove(profileId)
+        deleteLocal(p, fromSync = false, tombstone = ProfileRoster.undoWritesTombstone(undoesRosterAdd(profileId)))
         rosterUndoable.update { it - profileId }
         refreshActiveRole()
         Log.i(TAG, "[PROFILES] undo add ${p.username}")
@@ -1374,8 +1535,17 @@ class ProfileManager @Inject constructor(
         runCatching { pinStore.remove(profileId) }
         runCatching { snapshotStamps.remove("${p.playlistId}@$profileId") }
         runCatching { vodCatalogStore.deleteForPlaylistUser(p.playlistId, p.username) }
-        if (tombstone) runCatching { onProfilesMutated?.invoke(p.playlistId, p.username, "remove", 0L) }
+        // A held profile is removed on this device only: its row was never on
+        // the new server's roster, and a tombstone sent there after the pause
+        // could delete a same-named profile on that server's devices.
+        val held = hostHolds.isHeld(profileId)
+        if (RosterPause.writesTombstone(tombstone, held)) runCatching { onProfilesMutated?.invoke(p.playlistId, p.username, "remove", 0L) }
+        else if (held && !fromSync) runCatching { onProfilesMutated?.invoke(p.playlistId, p.username, "local-remove", 0L) }
         else if (!fromSync) runCatching { onProfilesMutated?.invoke(p.playlistId, p.username, "undo-add", 0L) }
+        dropHold(profileId, "removed")
+        rosterAdds.forget(profileId)
+        hostHolds.tag(profileId, null)
+        hostHolds.clearPausedAdd(profileId)
         store.remove(profileId)
         Log.i(TAG, "[PROFILE] removed ${p.username} on ${p.playlistId.take(8)}; local state deleted${if (fromSync) " (synced removal)" else ""}")
     }
@@ -1390,6 +1560,15 @@ class ProfileManager @Inject constructor(
     suspend fun switchTo(playlistId: String, profileId: String, bypassPin: Boolean = false): Result<Unit> = runCatching {
         if (!bypassPin && pinStore.hasPin(profileId)) {
             check(switchTickets.remove(profileId)) { "Enter PIN" }
+        }
+        if (unusable(profileId)) {
+            // Its sign-in is held after a server address change, or it has
+            // none stored: nothing is sent, and never the playlist's own.
+            // The "Sign in to Dispatcharr" form asks for a fresh one.
+            val held = hostHolds.isHeld(profileId)
+            _heldSignIn.value = HeldSignIn(playlistId, profileId, playlistDao.rawById(playlistId)?.name.orEmpty(), addressChanged = held)
+            Log.i(TAG, "[PROFILE-HOST] sign-in form opened for a ${if (held) "held" else "signed-out"} profile on ${playlistId.take(8)}")
+            throw ProfileSignInHeld()
         }
         val gen = switchGen.incrementAndGet()
         watchdog?.cancel()
@@ -1425,13 +1604,16 @@ class ProfileManager @Inject constructor(
         // before any network; sign-in and /me/ run behind the painted guide
         // (verifyWarmSwitch). Only a profile with no snapshot waits on them.
         val targetKey = if (target.isDefault) playlistId else "$playlistId@${target.id}"
-        val storedKey = (if (target.isDefault) row.apiKey else target.apiKey)?.takeIf { it.isNotBlank() }
+        val signIn = ProfileHostHold.usable(target, hostHolds.isHeld(target.id))
+        val storedKey = (if (target.isDefault) row.apiKey else signIn.apiKey)?.takeIf { it.isNotBlank() }
         val warm = storedKey != null &&
             snapshotStamps.get(targetKey) != null &&
             runCatching { channelSnapshotDao.newestFetchedAtKey(targetKey) }.getOrNull() != null
         if (warm) {
             mutex.withLock {
                 tLock = System.currentTimeMillis()
+                // A hold that landed since switchTo looked: never activate it.
+                if (!target.isDefault && unusable(target.id)) throw ProfileSignInHeld()
                 if (target.isDefault) {
                     ProfileScope.activate(null)
                     store.setActiveProfileId(playlistId, null)
@@ -1476,9 +1658,11 @@ class ProfileManager @Inject constructor(
                 tMe = System.currentTimeMillis()
                 ProfileScope.activate(null)
                 store.setActiveProfileId(playlistId, null)
-                if (me != null) applyMeToDefaultRow(playlistId, target.id, me)
+                if (me != null) applyMeToDefaultRow(playlistId, target.id, me, base, a.key)
             } else {
-                val a = authenticate(playlistId, target.id, base, target.username, target.password, target.apiKey)
+                if (unusable(target.id)) throw ProfileSignInHeld()
+                val held = ProfileHostHold.usable(target, hostHolds.isHeld(target.id))
+                val a = authenticate(playlistId, target.id, base, target.username, held.password, held.apiKey)
                 path = a.path
                 val key = a.key
                 tAuth = System.currentTimeMillis()
@@ -1488,7 +1672,9 @@ class ProfileManager @Inject constructor(
                 tMe = System.currentTimeMillis()
                 val updated = target.applyMe(me, key)
                 store.upsert(updated)
+                ownSignInRepaired(playlistId, updated.id)
                 followServerRole(updated.id, updated.userLevel)
+                runCatching { tagVerified(playlistId, updated.id) }
                 ProfileScope.activate(updated.toOverlay())
                 store.setActiveProfileId(playlistId, updated.id)
             }
@@ -1547,20 +1733,24 @@ class ProfileManager @Inject constructor(
                     if (gen != switchGen.get()) return
                     if (me != null) {
                         val before = playlistDao.rawById(playlistId)
-                        applyMeToDefaultRow(playlistId, target.id, me)
+                        applyMeToDefaultRow(playlistId, target.id, me, base, a.key)
                         val after = playlistDao.rawById(playlistId)
                         changed = SnapshotStaleness.normalize(before?.dispatcharrAccountProfileIds.orEmpty()) !=
                             SnapshotStaleness.normalize(after?.dispatcharrAccountProfileIds.orEmpty()) ||
                             before?.dispatcharrCatchupEnabled != after?.dispatcharrCatchupEnabled
                     }
                 } else {
+                    // Held since the switch (a server address change): its stored sign-in stays here.
+                    if (hostHolds.isHeld(target.id)) return
                     val a = authenticate(playlistId, target.id, base, target.username, target.password, target.apiKey)
                     val me = a.me ?: client.fetchMe(base, a.key)
                         ?: error("Could not read ${target.username} from the server.")
                     if (gen != switchGen.get()) return
                     val updated = target.applyMe(me, a.key)
                     store.upsert(updated)
+                    ownSignInRepaired(playlistId, updated.id)
                     followServerRole(updated.id, updated.userLevel)
+                    runCatching { tagVerified(playlistId, updated.id) }
                     if (ProfileScope.current() == target.id) ProfileScope.activate(updated.toOverlay())
                     val o1 = target.toOverlay()
                     val o2 = updated.toOverlay()
@@ -1582,6 +1772,422 @@ class ProfileManager @Inject constructor(
         } catch (t: Throwable) {
             Log.w(TAG, "[SWITCH] warm switch verification failed (stored profile kept): ${t.message}")
         }
+    }
+
+    // ---- Server address change (security fix A-APP-1, shared spec 2026-11-11) ----
+    // Edit Playlist, a device setup in place, and a Google Drive pull can move
+    // a playlist to another scheme, host, or port. Every non-default profile's
+    // stored sign-in is held from before the first request until users/me
+    // with the DEFAULT profile's sign-in proves the new address is the same
+    // server, or the profile signs in again. Logs never carry a key or a
+    // password, only the [PROFILE-HOST] lines below.
+
+    /** A held profile the user picked: the "Sign in to Dispatcharr" form is up for it. */
+    data class HeldSignIn(
+        val playlistId: String,
+        val profileId: String,
+        val playlistName: String,
+        /** Held after a server address change; false = it has no stored sign-in (the plain form). */
+        val addressChanged: Boolean = true,
+    )
+
+    private val _heldSignIn = kotlinx.coroutines.flow.MutableStateFlow<HeldSignIn?>(null)
+    val heldSignIn: kotlinx.coroutines.flow.StateFlow<HeldSignIn?> = _heldSignIn
+
+    /**
+     * Dispatcharr Sync hook (set by DispatcharrSyncManager): a server address
+     * change on a playlist starts (landed false, before anything is sent to
+     * the new address) or lands (true). Sync drops its saved server copy for
+     * every profile of that playlist and restarts at the current address.
+     */
+    @Volatile var onRouteChange: ((playlistId: String, landed: Boolean) -> Unit)? = null
+    private val routeChangeStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Playlists whose live profile a hold left for the default one; their screen reloads once the change lands. */
+    private val leftLive = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val checks = HashMap<String, kotlinx.coroutines.Job>()
+
+    fun isSignInHeld(profileId: String): Boolean = unusable(profileId)
+
+    /** [profileId] is non-default and its sign-in cannot be used: held, or none stored (treated the same). */
+    private fun unusable(profileId: String): Boolean =
+        store.byId(profileId)?.let { ProfileHostHold.signInUnusable(it, hostHolds.isHeld(it.id)) } == true
+
+    /** Open the plain sign-in form for [profileId], which has no stored sign-in. */
+    private fun openNoSignInForm(playlistId: String, profileId: String, playlistName: String) {
+        if (hostHolds.isHeld(profileId)) return
+        if (store.byId(profileId)?.let(ProfileHostHold::hasNoSignIn) != true) return
+        _heldSignIn.value = HeldSignIn(playlistId, profileId, playlistName, addressChanged = false)
+        Log.i(TAG, "[PROFILE] sign-in form opened: the active profile on ${playlistId.take(8)} has no stored sign-in")
+    }
+
+    /** Playlists whose Dispatcharr Sync `profiles` category is paused (some profile on them is held). */
+    private val _rosterPaused = kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet())
+
+    /** [playlistId]'s roster sync is paused in both directions (item 4): read by Dispatcharr Sync. */
+    fun isRosterPaused(playlistId: String): Boolean = hostHolds.isPaused(playlistId)
+
+    /**
+     * After any hold change: the held set the overlay checks, and the roster
+     * pause per playlist. A pause that ends asks for a profiles pull right
+     * away, so the roster merges and the edits that waited go out now.
+     */
+    private fun heldChanged() {
+        val heldNow = hostHolds.heldProfileIds()
+        // A Child with no stored sign-in stays sealed until it signs in.
+        val signedOut = ProfileScope.sealed.filter { id -> store.byId(id)?.let(ProfileHostHold::hasNoSignIn) == true }
+        val released = ProfileScope.sealed - heldNow - signedOut.toSet()
+        if (released.isNotEmpty()) {
+            ProfileScope.sealed = ProfileScope.sealed - released
+            if (ProfileScope.sealed.isEmpty()) ProfileScope.sealedRoutes = emptySet()
+            released.mapNotNull { store.byId(it)?.playlistId }.toSet().forEach { pid ->
+                Log.i(TAG, "[PROFILE-HOST] the held Child on ${pid.take(8)} is lifted; loading again")
+                scope.launch { reloads.send(Reload(pid, switchGen.get(), fromSwitch = false)) }
+            }
+        }
+        ProfileScope.held = heldNow
+        val now = hostHolds.pausedPlaylists()
+        val before = _rosterPaused.value
+        if (now == before) return
+        _rosterPaused.value = now
+        (now - before).forEach { Log.i(TAG, "[PROFILE-HOST] roster sync paused playlist=${it.take(8)}") }
+        (before - now).forEach { pid ->
+            Log.i(TAG, "[PROFILE-HOST] roster sync resumed playlist=${pid.take(8)}")
+            notePickerOpened(pid, "roster-resumed")
+        }
+    }
+
+    /** [profileId]'s Dispatcharr username (the held sign-in form's prefill), or "". */
+    fun profileUsername(profileId: String): String = store.byId(profileId)?.username.orEmpty()
+
+    /** The held profiles' stored sign-ins on [playlistId], only so a save can tell them from the playlist's own. Never sent. */
+    fun heldSignIns(playlistId: String): List<ProfileHostHold.SignIn> =
+        store.forPlaylist(playlistId).filter { !it.isDefault && hostHolds.isHeld(it.id) }
+            .map { ProfileHostHold.SignIn(it.apiKey, it.username, it.password) }
+
+    /**
+     * A route change on [playlistId]: BEFORE the caller sends anything, hold
+     * every non-default profile's stored sign-in, and leave a held active
+     * profile for the default one the way the tombstone path does, minus that
+     * path's sign-in (it would go to whichever address is current, and a
+     * failed one would leave the held profile active). Synchronous, with no
+     * network, no Room, and no lock, so it is safe inside the Drive pull's
+     * transaction. True when a profile is held.
+     */
+    fun holdSignInsForRouteChange(playlistId: String, oldBase: String?, oldLan: String?, newBase: String?, newLan: String?): Boolean {
+        if (!ProfileHostHold.routeChanged(oldBase, newBase, oldLan, newLan)) return false
+        // Dispatcharr Sync drops its saved copy of the old server's record for
+        // every profile here, whether or not any profile is held (item 6).
+        routeChangeStarted += playlistId
+        runCatching { onRouteChange?.invoke(playlistId, false) }
+        val ids = ProfileHostHold.toHold(store.forPlaylist(playlistId))
+        if (ids.isEmpty() && hostHolds.hold(playlistId) == null) return false
+        return placeHold(playlistId, ids, ProfileHostHold.routes(oldBase, oldLan), hostHolds.recorded(playlistId), ProfileHostHold.routes(newBase, newLan))
+    }
+
+    /**
+     * A sync merge (PlaylistCollapse) moved [moved] profiles from
+     * [fromPlaylist] into [toPlaylist]. The two share a server URL, but their
+     * local URLs can differ, so the moved sign-ins can land on an address
+     * they were never used at. When either route differs they are held like
+     * a route change, trusted at the old playlist's routes and checked
+     * against the identity recorded for it (every moved non-default profile,
+     * keyless ones included). Profiles already held stay held.
+     * Synchronous, no network, no lock. True when a profile is held.
+     */
+    fun holdMergedSignIns(
+        fromPlaylist: String,
+        toPlaylist: String,
+        moved: Collection<String>,
+        fromBase: String?,
+        fromLan: String?,
+        toBase: String?,
+        toLan: String?,
+    ): Boolean {
+        if (!ProfileHostHold.routeChanged(fromBase, toBase, fromLan, toLan)) return false
+        val ids = ProfileHostHold.toHold(moved.mapNotNull(store::byId)).filterNot(hostHolds::isHeld).toSet()
+        if (ids.isEmpty()) return false
+        return placeHold(toPlaylist, ids, ProfileHostHold.routes(fromBase, fromLan), hostHolds.recorded(fromPlaylist), ProfileHostHold.routes(toBase, toLan))
+    }
+
+    /** The playlist row, read off the main thread (restoreSync runs before any coroutine). Null on failure. */
+    private fun rawRowBlocking(playlistId: String): com.aeriotv.android.core.data.db.entity.PlaylistEntity? =
+        runCatching { kotlinx.coroutines.runBlocking(Dispatchers.IO) { playlistDao.rawById(playlistId) } }.getOrNull()
+
+    /** Keep the held Child [profileId] installed with no sign-in, and refuse Dispatcharr requests to [routes]. */
+    private fun seal(profileId: String, routes: Set<String>) {
+        ProfileScope.sealed = ProfileScope.sealed + profileId
+        if (routes.isNotEmpty()) ProfileScope.sealedRoutes = routes
+    }
+
+    /** Hold [ids] on [playlistId] before anything is sent, and leave a held active profile for the default one (a Child stays). */
+    private fun placeHold(
+        playlistId: String,
+        ids: Set<String>,
+        priorRoutes: Set<String>,
+        expected: ProfileHostHold.Identity?,
+        currentRoutes: Set<String>,
+    ): Boolean {
+        val activeId = store.activeProfileId(playlistId)
+        val live = ProfileScope.activeOverlay()?.let { it.profileId in ids } == true
+        // A Child active here stays active (item 8): sealed before it is held,
+        // so its overlay stays installed with no sign-in and nothing is sent.
+        val child = activeId?.takeIf { it in ids }?.let(store::byId)
+            ?.takeIf { ProfileHostHold.staysActiveWhenHeld(it.effectiveRole()) }
+        if (child != null) seal(child.id, currentRoutes)
+        // Memory first: from here no row is overlaid with a held sign-in.
+        ProfileScope.held = ProfileScope.held + ids
+        val rec = hostHolds.hold(playlistId, ids, priorRoutes, expected, currentRoutes) ?: return false
+        heldChanged()
+        Log.i(TAG, "[PROFILE-HOST] hold playlist=${playlistId.take(8)} profiles=${rec.profileIds.size}")
+        if (child != null) {
+            if (live) {
+                closePlayer.trySend(Unit)
+                tokenStore.clear(playlistId)
+            }
+            Log.i(TAG, "[PROFILE-HOST] the active Child on ${playlistId.take(8)} stays, held; leaving it needs a PIN")
+        } else if (activeId != null && hostHolds.isHeld(activeId)) {
+            store.setActiveProfileId(playlistId, null)
+            if (live) {
+                ProfileScope.activate(null)
+                tokenStore.clear(playlistId)
+                CapabilityCorrections.clear(playlistId)
+                closePlayer.trySend(Unit)
+                leftLive += playlistId
+                scope.launch { runCatching { timeshift.stopAllRetained("profile sign-in held") } }
+            }
+            refreshActiveRole(playlistId)
+            Log.i(TAG, "[PROFILE-HOST] switched playlist=${playlistId.take(8)} to the default profile")
+        }
+        return true
+    }
+
+    /**
+     * The route change on [playlistId] has landed, or its save failed and the
+     * row is back. [reloadUi]: the caller did not reload the playlist on
+     * screen, so a profile the hold left gets a silent channel refresh as the
+     * default one. Then the same-server check runs.
+     */
+    fun routeChangeSettled(playlistId: String, reloadUi: Boolean) {
+        if (routeChangeStarted.remove(playlistId)) runCatching { onRouteChange?.invoke(playlistId, true) }
+        if (leftLive.remove(playlistId) && reloadUi) {
+            scope.launch { reloads.send(Reload(playlistId, switchGen.get(), fromSwitch = false)) }
+        }
+        if (hostHolds.hold(playlistId) != null) scheduleSameServerCheck(playlistId)
+    }
+
+    /**
+     * Every successful users/me with the DEFAULT profile's sign-in reports
+     * here, from every path that reads it. With no hold the identity is
+     * recorded. With a hold it is only compared with the identity recorded
+     * before the change (never recorded), and the check runs again for any
+     * address still unproven. [key] must be the playlist's own key; another
+     * profile's answer is ignored.
+     */
+    suspend fun noteDefaultMe(playlistId: String, base: String, key: String, userId: Int, username: String) {
+        val row = playlistDao.rawById(playlistId) ?: return
+        val own = row.apiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        if (own != key.trim()) return
+        val current = ProfileHostHold.routes(row.urlString, row.lanUrlString)
+        val identity = ProfileHostHold.Identity(userId, username.trim())
+        when (val o = hostHolds.onAnswer(playlistId, ProfileHostHold.routeKey(base), current, ProfileHostHold.Answer.Me(identity))) {
+            is HostHoldBook.Outcome.Failed ->
+                Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=${o.reason} playlist=${playlistId.take(8)}")
+            // Profiles from before tags existed belong to the server this record came from.
+            HostHoldBook.Outcome.Recorded ->
+                hostHolds.tagUntagged(store.forPlaylist(playlistId).filterNot { it.isDefault }.map { it.id }, identity)
+            HostHoldBook.Outcome.Proven -> {
+                Log.i(TAG, "[PROFILE-HOST] same-server check passed reason=same-user playlist=${playlistId.take(8)}")
+                scheduleSameServerCheck(playlistId)
+            }
+            HostHoldBook.Outcome.Ignored -> if (hostHolds.hold(playlistId) != null) scheduleSameServerCheck(playlistId)
+        }
+    }
+
+    /**
+     * Tag [profileId] with the default identity users/me answers now at
+     * [base], where it just signed in: the live answer, never the frozen
+     * record. With no answer it stays untagged and never lifts on a check.
+     */
+    private suspend fun tagLive(playlistId: String, profileId: String, base: String) {
+        val key = playlistDao.rawById(playlistId)?.apiKey?.takeIf { it.isNotBlank() }
+        val me = key?.let { (client.checkMe(base, it) as? DispatcharrClient.MeCheck.Ok)?.me }
+        hostHolds.tag(profileId, me?.let { ProfileHostHold.Identity(it.id, it.username) })
+        if (me != null && key != null) runCatching { noteDefaultMe(playlistId, base, key, me.id, me.username) }
+    }
+
+    /** [profileId] was verified by a switch: tagged with the record when that is a live answer here. */
+    private suspend fun tagVerified(playlistId: String, profileId: String) {
+        val row = playlistDao.rawById(playlistId) ?: return
+        hostHolds.liveRecord(playlistId, ProfileHostHold.routes(row.urlString, row.lanUrlString))?.let { hostHolds.tag(profileId, it) }
+    }
+
+    private fun scheduleSameServerCheck(playlistId: String) {
+        synchronized(checks) {
+            if (checks[playlistId]?.isActive == true) return
+            checks[playlistId] = scope.launch {
+                try {
+                    sameServerCheck(playlistId)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w(TAG, "[PROFILE-HOST] same-server check failed reason=error playlist=${playlistId.take(8)} (${t.javaClass.simpleName})")
+                }
+            }
+        }
+    }
+
+    /**
+     * users/me with the default profile's sign-in at each address the
+     * playlist uses now that no check has proven, through the request gate.
+     * Same user id and username as recorded before the change at every one:
+     * the hold lifts. Anything else keeps it.
+     */
+    private suspend fun sameServerCheck(playlistId: String) {
+        val rec = hostHolds.hold(playlistId) ?: return
+        val row = playlistDao.rawById(playlistId) ?: return
+        // The snapshot taken before the change; with none it is not the same server.
+        if (rec.expected() == null) {
+            Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=no-record playlist=${playlistId.take(8)}")
+            return
+        }
+        val current = ProfileHostHold.routes(row.urlString, row.lanUrlString)
+        val unproven = ProfileHostHold.unproven(current, rec.trusted)
+        if (unproven.isEmpty()) {
+            // Every address in use is proven: an earlier answer matched, or it is one the snapshot came from (a failed save, or a move back).
+            liftHeld(playlistId, current, "proven")
+            return
+        }
+        val key = row.apiKey?.takeIf { it.isNotBlank() }
+        // Primes this playlist's auth header mode and User-Agent for the calls below.
+        if (key != null) repository.effectiveBaseUrl(row)
+        for (url in listOfNotNull(row.urlString, row.lanUrlString).filter { ProfileHostHold.routeKey(it) in unproven }) {
+            val answer = if (key == null) ProfileHostHold.Answer.NoKey else when (val r = client.checkMe(url, key)) {
+                is DispatcharrClient.MeCheck.Ok -> ProfileHostHold.Answer.Me(ProfileHostHold.Identity(r.me.id, r.me.username))
+                DispatcharrClient.MeCheck.Rejected -> ProfileHostHold.Answer.Rejected
+                DispatcharrClient.MeCheck.Unreachable -> ProfileHostHold.Answer.Unreachable
+            }
+            when (val o = hostHolds.onAnswer(playlistId, ProfileHostHold.routeKey(url), current, answer)) {
+                is HostHoldBook.Outcome.Failed -> {
+                    Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=${o.reason} playlist=${playlistId.take(8)}")
+                    return
+                }
+                HostHoldBook.Outcome.Proven ->
+                    Log.i(TAG, "[PROFILE-HOST] same-server check passed reason=same-user playlist=${playlistId.take(8)}")
+                else -> Unit
+            }
+        }
+        liftHeld(playlistId, current, "same-user")
+    }
+
+    /** Lifts the held profiles whose tag is the snapshot; the rest stay held and ask to sign in. */
+    private fun liftHeld(playlistId: String, current: Set<String>, reason: String) {
+        val ids = hostHolds.liftMatching(playlistId, current)
+        heldChanged()
+        if (ids.isEmpty()) return
+        val kept = hostHolds.hold(playlistId)?.profileIds?.size ?: 0
+        Log.i(TAG, "[PROFILE-HOST] lifted playlist=${playlistId.take(8)} profiles=${ids.size} kept=$kept reason=$reason")
+    }
+
+    /** [profileId] signed in again, was removed, or was just added: it is no longer held. */
+    private fun dropHold(profileId: String, reason: String) {
+        val pid = hostHolds.liftProfile(profileId) ?: return
+        heldChanged()
+        Log.i(TAG, "[PROFILE-HOST] lifted playlist=${pid.take(8)} profiles=1 reason=$reason")
+    }
+
+    /**
+     * The playlist was deleted: its recorded identity and its hold go. Held
+     * profiles a sync merge moved to another playlist stay held until they
+     * sign in again.
+     */
+    fun forgetPlaylistHost(playlistId: String) {
+        val moved = hostHolds.hold(playlistId)?.profileIds.orEmpty()
+            .filter { id -> store.byId(id)?.playlistId?.let { it != playlistId } == true }.toSet()
+        hostHolds.forgetPlaylist(playlistId, moved)
+        heldChanged()
+    }
+
+    /** Cancel on the form: stay on the current profile. */
+    fun closeHeldSignIn() {
+        if (_heldSignIn.value != null) Log.i(TAG, "[PROFILE-HOST] sign-in form closed")
+        _heldSignIn.value = null
+    }
+
+    /**
+     * The form for a held profile: sign in at the playlist's current address
+     * with the typed username and password (the existing login path and
+     * throttle), read the account's current key from users/me, replace that
+     * profile's key and password, lift its hold only, and finish the switch.
+     * Only for the profile whose switch opened the form (its PIN, if any,
+     * passed there). Never logs the password or the key.
+     */
+    suspend fun signInHeldProfile(playlistId: String, profileId: String, username: String, password: String): Result<Unit> = runCatching {
+        val req = _heldSignIn.value
+        check(req != null && req.playlistId == playlistId && req.profileId == profileId) { "Choose the profile again." }
+        val p = store.byId(profileId)?.takeIf { it.playlistId == playlistId && !it.isDefault } ?: error("Profile not found")
+        val row = playlistDao.rawById(playlistId) ?: error("Playlist not found")
+        val base = repository.effectiveBaseUrl(row)
+        val jwt = client.login(base, username.trim(), password, childSealBypass = true)
+        val key = client.fetchCurrentUserApiKey(base, jwt.access, childSealBypass = true)
+        val me = client.fetchMe(base, key, childSealBypass = true) ?: throw DispatcharrError.Transport("Could not read the account.")
+        // Another account's sign-in never becomes this profile's.
+        if (!ProfileHostHold.isOwnUser(p.username, me.username)) throw DispatcharrError.InvalidCredentials("Signed in as another user.")
+        store.update(profileId) { it.copy(password = password).applyMe(me, key) }
+        ownSignInRepaired(playlistId, profileId)
+        dropHold(profileId, "sign-in")
+        // A Child that had no stored sign-in is no longer sealed.
+        heldChanged()
+        runCatching { tagLive(playlistId, profileId, base) }
+        // The form closes now and the switch's scrim takes over; run it on
+        // the manager's scope so closing the form never cancels it.
+        ProfileSwitchFocus.arm(ProfileSwitchFocus.Target.Guide)
+        scope.launch { finishHeldSwitch(playlistId, profileId) }
+        Unit
+    }
+
+    /**
+     * The rejected-key prompt's Sign In when the refused key is a non-default
+     * profile's own (Apple parity, 2026-11-12): sign in as THAT profile's own
+     * user only (the held-profile form's rule), at the playlist's address,
+     * store its new key and password, and lift only its own hold. The
+     * playlist's own sign-in is never touched. Requests and streams still
+     * built with the refused key go out with the new one. Never logs the
+     * password or the key.
+     */
+    suspend fun signInRejectedProfile(playlistId: String, profileId: String, username: String, password: String): Result<Unit> = runCatching {
+        val p = store.byId(profileId)?.takeIf { it.playlistId == playlistId && !it.isDefault } ?: error("Profile not found")
+        // A held profile signs in through its own form (the address changed).
+        if (hostHolds.isHeld(profileId)) throw ProfileSignInHeld()
+        val row = playlistDao.rawById(playlistId) ?: error("Playlist not found")
+        val base = repository.effectiveBaseUrl(row)
+        val jwt = client.login(base, username.trim(), password)
+        val key = client.fetchCurrentUserApiKey(base, jwt.access)
+        val me = client.fetchMe(base, key) ?: throw DispatcharrError.Transport("Could not read the account.")
+        if (!ProfileHostHold.isOwnUser(p.username, me.username)) throw DispatcharrError.InvalidCredentials("Signed in as another user.")
+        val oldKey = p.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+        store.update(profileId) { it.copy(password = password).applyMe(me, key) }
+        val updated = store.byId(profileId)
+        updated?.let { followServerRole(it.id, it.userLevel) }
+        ownSignInRepaired(playlistId, profileId)
+        com.aeriotv.android.core.network.DispatcharrRequestGate.clearKey(key)
+        if (oldKey != null && oldKey != key.trim()) com.aeriotv.android.core.network.DispatcharrRequestGate.noteKeyReplaced(oldKey, key)
+        DispatcharrLoginGate.reset(DispatcharrLoginGate.slotFor(playlistId, profileId))
+        // Still the active one: it goes on with its new key.
+        if (ProfileScope.current() == profileId) store.byId(profileId)?.let { ProfileScope.activate(it.toOverlay()) }
+        refreshActiveRole(playlistId)
+        Log.i(TAG, "[AUTH] profile ${profileId.take(8)} on ${playlistId.take(8)} signed in from the rejected-key prompt; its own hold lifted")
+        Unit
+    }
+
+    private suspend fun finishHeldSwitch(playlistId: String, profileId: String) {
+        val r = switchTo(playlistId, profileId, bypassPin = true)
+        if (r.isSuccess && _launchPicker.value?.playlistId == playlistId) {
+            switchTickets.remove(profileId)
+            _launchPicker.value = null
+            releaseLaunchHoldIfClear()
+        }
+        r.exceptionOrNull()?.let { Log.w(TAG, "[PROFILE-HOST] switch after sign-in failed (${it.javaClass.simpleName})") }
     }
 
     /** [username] is the Dispatcharr username, never the display name. */
@@ -1655,6 +2261,15 @@ class ProfileManager @Inject constructor(
         return k
     }
 
+    /**
+     * [profileId] just signed in as itself (its key read back from users/me):
+     * a rejection held for its own earlier key is released. Holds are per
+     * identity; repairing the playlist's own sign-in never does this.
+     */
+    private fun ownSignInRepaired(playlistId: String, profileId: String) {
+        com.aeriotv.android.core.network.DispatcharrRequestGate.clearProfile(playlistId, profileId)
+    }
+
     private fun DispatcharrProfile.applyMe(me: MeResponse, key: String): DispatcharrProfile {
         val props: JsonObject? = me.customProperties
         fun flag(name: String): Boolean = (props?.get(name) as? JsonPrimitive)?.booleanOrNull != false
@@ -1681,7 +2296,9 @@ class ProfileManager @Inject constructor(
     }
 
     /** The default profile's /me/ facts onto the playlist row, like the probe writes them. */
-    private suspend fun applyMeToDefaultRow(playlistId: String, profileId: String, me: MeResponse) {
+    private suspend fun applyMeToDefaultRow(playlistId: String, profileId: String, me: MeResponse, base: String, key: String) {
+        // The default profile's users/me: recorded, or the same-server check while a hold is in place.
+        runCatching { noteDefaultMe(playlistId, base, key, me.id, me.username) }
         val props: JsonObject? = me.customProperties
         fun flag(name: String): Boolean = (props?.get(name) as? JsonPrimitive)?.booleanOrNull != false
         kotlinx.coroutines.withContext(ProfileScope.defaultOnly()) {

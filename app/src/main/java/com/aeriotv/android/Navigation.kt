@@ -625,6 +625,7 @@ fun AerioTVNavHost(
                             popUpTo(Routes.PLAYLIST_GRAPH) { inclusive = false }
                         }
                     },
+                    notice = state.bootstrapLine,
                 )
             }
 
@@ -1315,6 +1316,11 @@ fun AerioTVNavHost(
                 com.aeriotv.android.feature.settings.ApiKeyRejectedPromptHost(
                     onEditPlaylist = { id ->
                         vm.requestSettingsPage(com.aeriotv.android.feature.settings.EDIT_PLAYLIST_PAGE_PREFIX + id)
+                    },
+                    // Fix Login (TV) or the sign-in form: the new sign-in is in
+                    // and the hold is lifted; the playlist on screen reloads its channels.
+                    onSignedIn = { id ->
+                        if (vm.state.value.playlist?.id == id) vm.refreshPlaylist(fromRecovery = true)
                     },
                 )
                 // Capability gates read the LIVE active row: the UiState snapshot

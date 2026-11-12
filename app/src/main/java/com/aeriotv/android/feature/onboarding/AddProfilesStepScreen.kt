@@ -26,16 +26,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -54,8 +51,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -120,13 +115,20 @@ class AddProfilesStepViewModel @Inject constructor(
         Step.Skip
     }
 
+    /**
+     * The adds the PIN step may undo (item 14, Apple parity): the current
+     * "Add selected" batch only. A manual add asks on its own right after it
+     * lands; Continue passes none, and a setup handoff's adds always stay.
+     */
+    val pinAdds = OnboardingPinAdds()
+
     suspend fun addManual(playlistId: String, username: String, password: String?, apiKey: String?, role: com.aeriotv.android.core.profiles.ProfileRole? = null) =
         (if (apiKey != null) manager.addProfileByApiKey(playlistId, apiKey, role)
         else manager.addProfileManual(playlistId, username, password, null, role))
             .onSuccess { manager.markFreshAddUndoable(it.id) }
 
     suspend fun add(playlistId: String, user: DispatcharrUserSummary, password: String?, apiKey: String?, role: com.aeriotv.android.core.profiles.ProfileRole? = null) =
-        manager.addProfile(playlistId, user, password, apiKey, role)
+        manager.addProfile(playlistId, user, password, apiKey, role).onSuccess { pinAdds.batchAdded(it.id) }
 
     private companion object { const val TAG = "AddProfilesStep" }
 }
@@ -144,16 +146,23 @@ fun AddProfilesStepScreen(
     vm: AddProfilesStepViewModel = hiltViewModel(),
 ) {
     // Assumption A (2026-10-29): once a Child exists, every Admin and Standard
-    // profile added here sets its PIN before the step ends; cancel undoes those adds.
+    // profile added here sets its PIN. As on Apple (item 14), the PIN step
+    // comes right after each manual add (ManualAddProfilesStep) and right
+    // after each "Add selected" batch, whose Cancel undoes only that batch;
+    // Continue walks any PIN still missing and undoes nothing.
     val pinVm: com.aeriotv.android.feature.settings.ProfilesViewModel = hiltViewModel()
-    var pinWalk by remember { mutableStateOf(false) }
+    var pinWalk by remember { mutableStateOf<List<String>?>(null) }
     val finishStep = onDone
-    @Suppress("NAME_SHADOWING")
-    val onDone: () -> Unit = {
-        if (pinVm.anyChild(playlistId) && pinVm.pinsMissingForChild(playlistId).isNotEmpty()) pinWalk = true else finishStep()
+    val endStep: (List<String>) -> Unit = { adds ->
+        if (pinVm.anyChild(playlistId) && pinVm.pinsMissingForChild(playlistId).isNotEmpty()) pinWalk = adds else finishStep()
     }
-    if (pinWalk) {
-        com.aeriotv.android.feature.settings.PinAfterAdd(playlistId, pinVm) { pinWalk = false; finishStep() }
+    // Continue (and a step with nothing to add): the walk passes no adds.
+    @Suppress("NAME_SHADOWING")
+    val onDone: () -> Unit = { endStep(vm.pinAdds.continueAdds()) }
+    // The end of an "Add selected" batch: its PIN step undoes only that batch.
+    val afterBatch: () -> Unit = { endStep(vm.pinAdds.batchAdds()) }
+    pinWalk?.let { adds ->
+        com.aeriotv.android.feature.settings.PinAfterAdd(playlistId, pinVm, adds) { pinWalk = null; finishStep() }
         return
     }
     var users by remember { mutableStateOf<List<DispatcharrUserSummary>?>(null) }
@@ -250,10 +259,9 @@ fun AddProfilesStepScreen(
         if (q.isEmpty()) rest else rest.filter { it.username.contains(q, ignoreCase = true) }
     }
     // The user list is the primary content and takes the height; search only
-    // filters it. TV (landscape, ~540 dp tall) puts the list on the left and
-    // Role plus the buttons on the right so rows are never squeezed (owner
-    // 2026-10-27: one row was left ~85 px and overlapped by Role). Phones
-    // stack it: list, compact Role, buttons pinned at the bottom.
+    // filters it. Phones stack it: list, compact Role, buttons pinned at the
+    // bottom. TV is one centered column that scrolls as a whole, with
+    // Continue under the roster (TvWhoWatchesColumn).
     val isTv = com.aeriotv.android.ui.settings.rememberIsTvDevice()
     val device = rememberDeviceNoun()
     val header: @Composable () -> Unit = {
@@ -267,10 +275,25 @@ fun AddProfilesStepScreen(
     val imeVisible = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
     val searchOnly = imeVisible && serverExpanded && !isTv
     LaunchedEffect(searchOnly) { if (searchOnly) listScroll.scrollTo(0) }
+    // TV: the first row takes focus when the step opens (Apple TV's default
+    // focus is the topmost control): a suggestion, else Add from
+    // Dispatcharr, else Continue.
+    val continueFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val restNow by androidx.compose.runtime.rememberUpdatedState(rest)
+    if (isTv) LaunchedEffect(Unit) {
+        // One frame for the roster suggestions to land.
+        kotlinx.coroutines.delay(100)
+        when {
+            suggested.isNotEmpty() -> focusRoster = suggested.first().username
+            restNow.isNotEmpty() -> runCatching { cardFocus.requestFocus() }
+            else -> runCatching { continueFocus.requestFocus() }
+        }
+    }
     val userList: @Composable (Modifier) -> Unit = { listModifier ->
                 Column(
-                    modifier = listModifier.fillMaxWidth().verticalScroll(listScroll),
-                    verticalArrangement = Arrangement.spacedBy(if (isTv) 4.dp else 0.dp),
+                    // TV: the whole page scrolls (TvWhoWatchesColumn), not the list.
+                    modifier = listModifier.fillMaxWidth().then(if (isTv) Modifier else Modifier.verticalScroll(listScroll)),
+                    verticalArrangement = Arrangement.spacedBy(if (isTv) 6.dp else 0.dp),
                 ) {
                     if (!searchOnly) OnThisDeviceSection(
                         device, localProfiles,
@@ -280,7 +303,15 @@ fun AddProfilesStepScreen(
                             undoBusy = true
                             scope.launch {
                                 profilesVm.undoAdd(p.id).fold(
-                                    { undoBusy = false; if (isTv) focusRoster = p.username },
+                                    {
+                                        undoBusy = false
+                                        // TV: the minus leaves with the row. Focus goes to the
+                                        // suggestion it came from, else to Add from Dispatcharr.
+                                        if (isTv) {
+                                            if (suggested.any { it.username.equals(p.username, ignoreCase = true) }) focusRoster = p.username
+                                            else focusMove = false
+                                        }
+                                    },
                                     { undoBusy = false; error = it.message ?: "Could not remove profile" },
                                 )
                             }
@@ -288,7 +319,7 @@ fun AddProfilesStepScreen(
                         focusRemoveFor = focusRemove,
                         onFocusConsumed = { focusRemove = null },
                     )
-                    if (!searchOnly) Spacer(Modifier.height(10.dp))
+                    if (!searchOnly && !isTv) Spacer(Modifier.height(10.dp))
                     if (!searchOnly) com.aeriotv.android.feature.settings.RosterSuggestions(
                         playlistId, profilesVm, list, enabled = !busy,
                         title = "FROM YOUR OTHER DEVICES",
@@ -299,7 +330,7 @@ fun AddProfilesStepScreen(
                         onFocusConsumed = { focusRoster = null },
                     )
                     if (rest.isNotEmpty() && !searchOnly) {
-                        Spacer(Modifier.height(10.dp))
+                        if (!isTv) Spacer(Modifier.height(10.dp))
                         AddFromDispatcharrRow(
                             enabled = !busy,
                             expanded = serverExpanded,
@@ -312,32 +343,15 @@ fun AddProfilesStepScreen(
                     if (serverExpanded) shown.forEachIndexed { index, user ->
                         val checked = user.id in selected
                         // TV: the row and the role chip are two focus stops.
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Row(
-                            modifier = Modifier
-                                .weight(1f)
-                                .then(if (index == 0) Modifier.focusRequester(firstRowFocus) else Modifier)
-                                .heightIn(min = 56.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .dpadFocusRing(RoundedCornerShape(12.dp), washTint = MaterialTheme.colorScheme.primary)
-                                .toggleable(
-                                    value = checked,
-                                    enabled = !busy,
-                                    role = Role.Checkbox,
-                                    onValueChange = { on -> if (on) selected.add(user.id) else selected.remove(user.id) },
-                                )
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(checked = checked, onCheckedChange = null)
-                            Spacer(Modifier.size(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(user.username, style = MaterialTheme.typography.titleMedium)
-                                com.aeriotv.android.feature.settings.ServerUserCaption(user)
-                            }
-                        }
-                        if (checked) com.aeriotv.android.feature.settings.RoleChip(roleOf(user), enabled = !busy, locked = user.isServerAdmin()) { rowRoles[user.id] = it }
-                        }
+                        ServerUserPickRow(
+                            user = user,
+                            checked = checked,
+                            enabled = !busy,
+                            role = roleOf(user),
+                            onCheckedChange = { on -> if (on) selected.add(user.id) else selected.remove(user.id) },
+                            onRole = { rowRoles[user.id] = it },
+                            rowModifier = if (index == 0) Modifier.focusRequester(firstRowFocus) else Modifier,
+                        )
                         if (canManageKeys && (user.apiKey.isNullOrBlank() || minted[user.id] == true)) {
                             com.aeriotv.android.feature.settings.EnableApiAccessRow(
                                 playlistId, profilesVm, user,
@@ -372,6 +386,7 @@ fun AddProfilesStepScreen(
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
                 val addSelected: () -> Unit = {
                         busy = true; error = null
+                        vm.pinAdds.startBatch()
                         scope.launch {
                             val failures = mutableListOf<String>()
                             list.filter { it.id in selected }.forEach { u ->
@@ -386,13 +401,12 @@ fun AddProfilesStepScreen(
                                 error = "Could not add: ${failures.joinToString(", ")}"
                                 selected.retainAll(list.filter { it.username in failures }.map { it.id })
                             } else if (needsCredential.isEmpty()) {
-                                onDone()
+                                afterBatch()
                             }
                         }
                 }
                 pendingAdd[0] = addSelected
-                Button(
-                    onClick = {
+                val onContinue: () -> Unit = {
                         when {
                             selected.isEmpty() -> onDone()
                             // A Child row needs every Admin and Standard profile to hold a PIN first.
@@ -400,7 +414,18 @@ fun AddProfilesStepScreen(
                                 !profilesVm.childGateClear(playlistId) -> childGate = true
                             else -> addSelected()
                         }
-                    },
+                }
+                // TV: Apple TV's 60 pt pill on the shared onboarding pill. Never
+                // disabled mid-flow (focus would fall away); taps wait while busy.
+                if (isTv) com.aeriotv.android.feature.onboarding.components.TvOnboardingPillButton(
+                    label = if (selected.isNotEmpty()) "Add selected" else "Continue",
+                    filled = true,
+                    busy = busy,
+                    onClick = { if (!busy) onContinue() },
+                    modifier = Modifier.focusRequester(continueFocus),
+                )
+                else Button(
+                    onClick = onContinue,
                     enabled = !busy,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp).dpadFocusRing(RoundedCornerShape(50), onFilled = true),
                     colors = ButtonDefaults.buttonColors(
@@ -433,7 +458,8 @@ fun AddProfilesStepScreen(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing)
-            .padding(horizontal = vp.gutter, vertical = 24.dp)
+            // TV: the vertical padding sits inside the page scroll (TvWhoWatchesColumn).
+            .padding(horizontal = vp.gutter, vertical = if (isTv) 0.dp else 24.dp)
             // Opened from Settings the floating tab bar stays up, and on the
             // onn tablet it covered Continue and the hint under it
             // (2026-11-07). None during onboarding or on TV, where there
@@ -442,47 +468,13 @@ fun AddProfilesStepScreen(
         contentAlignment = Alignment.TopCenter,
     ) {
         if (isTv) {
-            Column(
-                modifier = Modifier.widthIn(max = 1100.dp).fillMaxWidth().fillMaxHeight(),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                // Title and subtitle centered across the full content width.
-                Column(
-                    modifier = Modifier.widthIn(max = vp.onboardingMaxWidth).fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) { header() }
-                // One centered column (tvOS review 2026-11-05, Apple parity):
-                // the roster at full width, then Continue and the count line
-                // under it, instead of a list beside an actions column.
-                Box(Modifier.fillMaxWidth().weight(1f)) {
-                    userList(Modifier.fillMaxHeight())
-                    if (listScroll.canScrollForward) {
-                        Box(
-                            Modifier
-                                .align(Alignment.BottomCenter)
-                                .fillMaxWidth()
-                                .height(48.dp)
-                                .background(
-                                    androidx.compose.ui.graphics.Brush.verticalGradient(
-                                        listOf(
-                                            androidx.compose.ui.graphics.Color.Transparent,
-                                            MaterialTheme.colorScheme.background,
-                                        ),
-                                    ),
-                                ),
-                        )
-                    }
-                }
-                Column(
-                    modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    controlsTail()
-                }
-            }
+            // One centered column (tvOS review 2026-11-05, Apple parity): the
+            // roster, then Continue and the count line under it.
+            TvWhoWatchesColumn(
+                header = header,
+                list = { userList(Modifier) },
+                controls = controlsTail,
+            )
         } else {
             Column(
                 modifier = (if (vp.onboardingMaxWidth != androidx.compose.ui.unit.Dp.Unspecified)
@@ -509,11 +501,11 @@ fun AddProfilesStepScreen(
             user = u,
             onSubmit = { password, key ->
                 vm.add(playlistId, u, password, key, roleOf(u)).fold(
-                    { needsCredential.remove(u); if (needsCredential.isEmpty() && error == null) onDone(); null },
+                    { needsCredential.remove(u); if (needsCredential.isEmpty() && error == null) afterBatch(); null },
                     { it.message ?: "Could not add profile" },
                 )
             },
-            onCancel = { needsCredential.remove(u); if (needsCredential.isEmpty() && error == null) onDone() },
+            onCancel = { needsCredential.remove(u); if (needsCredential.isEmpty() && error == null) afterBatch() },
         )
     }
 }
@@ -595,7 +587,9 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
     val firstCardFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val firstFieldFocus = remember { androidx.compose.ui.focus.FocusRequester() }
     val continueFocus = remember { androidx.compose.ui.focus.FocusRequester() }
-    // Focus hand-offs: 1 = first ADD A PROFILE card, 2 = Continue, 3 = first field.
+    val addCardFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    // Focus hand-offs: 1 = first ADD A PROFILE card, 2 = Continue, 3 = first
+    // field, 4 = Add another profile.
     var focusTarget by remember { mutableStateOf(0) }
     LaunchedEffect(focusTarget) {
         val t = focusTarget
@@ -606,42 +600,70 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
                 1 -> firstCardFocus.requestFocus()
                 2 -> continueFocus.requestFocus()
                 3 -> firstFieldFocus.requestFocus()
+                4 -> addCardFocus.requestFocus()
             }
         }
         focusTarget = 0
+    }
+    // TV: the first row takes focus when the step opens (Apple TV's default
+    // focus is the topmost control): a suggestion, else Add another profile.
+    val suggestFlow = remember(playlistId) { vm.suggestions(playlistId) }
+    val suggested by suggestFlow.collectAsStateWithLifecycle(initialValue = emptyList())
+    if (isTv) LaunchedEffect(Unit) {
+        // One frame for the roster suggestions to land.
+        kotlinx.coroutines.delay(100)
+        if (suggested.isNotEmpty()) focusRoster = suggested.first().username else focusTarget = 4
     }
     fun collapseAfterAdd() {
         wantsMore = null; scanOpen = false; detailsOpen = false
         role = com.aeriotv.android.core.profiles.ProfileRole.User
         focusTarget = 2
     }
+    // Item 14 (Apple parity): an add that needs a PIN (a Child exists) asks
+    // right after it lands; Cancel there undoes only this add.
+    var pinAfterAdd by remember { mutableStateOf<List<String>?>(null) }
     // A Child add goes through the same Child-PIN gate as the role rows.
     suspend fun addWith(username: String, password: String?, apiKey: String?): String? =
         vm.addManual(playlistId, username, password, apiKey, role).fold(
-            { collapseAfterAdd(); null },
+            { p ->
+                pinAfterAdd = OnboardingPinAdds.afterManualAdd(p.id, profilesVm.needsPinAfterAdd(playlistId, p.id))
+                collapseAfterAdd()
+                null
+            },
             { it.message ?: "Could not add profile" },
         )
     val context = androidx.compose.ui.platform.LocalContext.current
     var scanStatus by remember { mutableStateOf<String?>(null) }
     var scanBusy by remember { mutableStateOf(false) }
+    val pageScroll = rememberScrollState()
+    // TV: focus back on a control near the top scrolls the page to its top.
+    com.aeriotv.android.ui.tv.TvTopSnapPage(pageScroll, enabled = isTv) {
     Box(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.safeDrawing)
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(pageScroll)
             .padding(horizontal = vp.gutter, vertical = 24.dp)
             // Opened from Settings the floating tab bar stays up, and on the
             // onn tablet it covered Continue and the hint under it
             // (2026-11-07). None during onboarding or on TV, where there
             // is no tab bar.
             .padding(bottom = if (onboarding || com.aeriotv.android.ui.settings.rememberIsTvDevice()) 0.dp else com.aeriotv.android.ui.adaptive.LocalTabBarBottomInset.current),
-        contentAlignment = Alignment.TopCenter,
+        // TV: centered with the same space above and below when it fits; the
+        // scroll keeps the screen height as the minimum, so a taller page
+        // still scrolls as one from the top (Logan, 2026-11-11).
+        contentAlignment = if (isTv) Alignment.Center else Alignment.TopCenter,
     ) {
+        Inside {
         Column(
-            modifier = if (vp.onboardingMaxWidth != androidx.compose.ui.unit.Dp.Unspecified)
+            // TV: Apple TV's 1000 pt column and 18 pt gaps at half scale on
+            // the 960 x 540 dp canvas (the frame's 40 / 24 dp padding is its
+            // 80 / 48 pt).
+            modifier = if (isTv) Modifier.widthIn(max = 500.dp).fillMaxWidth()
+            else if (vp.onboardingMaxWidth != androidx.compose.ui.unit.Dp.Unspecified)
                 Modifier.widthIn(max = vp.onboardingMaxWidth).fillMaxWidth()
             else Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(if (isTv) 9.dp else 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (onboarding) com.aeriotv.android.feature.onboarding.components.StepCaption(2, 3)
@@ -684,6 +706,9 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
                 },
                 // One accent outline at a time: the open child card carries it.
                 highlighted = false,
+                // TV: the compact card the Welcome and Connect a Server cards use.
+                compact = isTv,
+                modifier = Modifier.focusRequester(addCardFocus),
                 trailing = {
                     Icon(
                         if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ChevronRight,
@@ -738,6 +763,7 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
                         if (detailsOpen) { scanOpen = false; if (isTv) focusTarget = 3 }
                     },
                     highlighted = detailsOpen,
+                    compact = isTv,
                     modifier = if (isTv) Modifier.focusRequester(firstCardFocus) else Modifier,
                 )
                 if (detailsOpen) {
@@ -756,13 +782,20 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth()) }
             Spacer(Modifier.height(4.dp))
-            // onDone is the caller's wrapper: adding next to a Child walks the PIN step first.
+            // onDone is the caller's wrapper: next to a Child, Continue walks any PIN still missing (no adds to undo).
             // While Enter details is open, Add profile is the single filled primary.
             val continueModifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 54.dp)
                 .focusRequester(continueFocus)
-            if (expanded && detailsOpen) androidx.compose.material3.OutlinedButton(
+            // TV: Apple TV's full-width 60 pt pill on the shared onboarding pill.
+            if (isTv) com.aeriotv.android.feature.onboarding.components.TvOnboardingPillButton(
+                label = "Continue",
+                filled = !(expanded && detailsOpen),
+                onClick = onDone,
+                modifier = Modifier.focusRequester(continueFocus),
+            )
+            else if (expanded && detailsOpen) androidx.compose.material3.OutlinedButton(
                 onClick = onDone,
                 modifier = continueModifier.dpadFocusRing(RoundedCornerShape(50)),
                 border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
@@ -783,7 +816,14 @@ private fun ManualAddProfilesStep(playlistId: String, vm: AddProfilesStepViewMod
                     modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).dpadFocusRing(RoundedCornerShape(50)),
                 ) { Text("Set up another device with this playlist", style = MaterialTheme.typography.titleMedium) }
             }
-            Spacer(Modifier.height(16.dp))
+            // Phones: room so a toast does not cover the footer. TV: none, so
+            // the space below the page matches the space above it.
+            if (!isTv) Spacer(Modifier.height(16.dp))
         }
+        }
+    }
+    }
+    pinAfterAdd?.let { adds ->
+        com.aeriotv.android.feature.settings.PinAfterAdd(playlistId, profilesVm, adds) { pinAfterAdd = null }
     }
 }

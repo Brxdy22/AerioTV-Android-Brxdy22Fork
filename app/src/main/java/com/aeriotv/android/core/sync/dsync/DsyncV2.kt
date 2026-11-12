@@ -35,6 +35,25 @@ enum class DsyncBucket(val local: String, val keys: List<DsyncKey>) {
  * Collisions cannot mix data: App Data is stored per user. Apple
  * Shared/Dsync/DsyncV2.swift DsyncKeyName is identical.
  */
+/**
+ * The saved copy of the server's record that a PUT starts from (item 6 of
+ * the profile follow-ups, 2026-11-11): the whole bucket ("braw") and each
+ * category's last server envelope, data, and stamps ("raw", "data", "at",
+ * "dev"), kept per playlist and profile but not per server. A server
+ * address change drops them for every profile of the playlist, so the first
+ * sync at the new address reads before it writes and never carries the old
+ * server's categories there. Local data and local change marks stay. Pure.
+ */
+object DsyncServerCopy {
+    val NAMES: Set<String> = setOf("braw", "raw", "data", "at", "dev")
+
+    /** The saved-state keys ("name|playlist|profile[|...]") that hold [playlistId]'s server copy, for every profile. */
+    fun keys(all: Collection<String>, playlistId: String): List<String> = all.filter { key ->
+        val parts = key.split('|')
+        parts.size >= 3 && parts[0] in NAMES && parts[1] == playlistId
+    }
+}
+
 object DsyncKeyName {
     /** The key every release before 2026-11-05 used, plus its `.`-suffixed v1 and v2 keys. */
     const val LEGACY_MAIN = "app.molinete.aerio"
@@ -65,6 +84,16 @@ object DsyncKeyName {
     fun isLegacy(name: String): Boolean = name == LEGACY_MAIN || name.startsWith("$LEGACY_MAIN.")
     /** Any user's main key (the restore probe, which runs before the username is read). */
     fun isMain(name: String): Boolean = name.endsWith(SUFFIX) && name.length > SUFFIX.length && DsyncKey.isValidKeyName(name)
+
+    /**
+     * A no-session `profiles` push (the launch picker's add or remove) may
+     * write only after the same list call a session makes shows no legacy
+     * key for the user. A session moves those first ([renamePlan]); a write
+     * before that would create `<user>.aeriotv`, and the legacy data would
+     * never move. [listed] null = the list call failed: nothing was read, so
+     * the change waits for the next session as well.
+     */
+    fun noSessionPushAllowed(listed: Collection<String>?): Boolean = listed != null && listed.none(::isLegacy)
 
     /** Legacy keys to move under [main]: every `app.molinete.aerio*` key, sorted, when [main] is absent from the list. */
     fun renamePlan(listed: Collection<String>, main: String): List<String> =

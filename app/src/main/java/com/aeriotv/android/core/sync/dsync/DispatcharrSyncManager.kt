@@ -128,7 +128,8 @@ class DispatcharrSyncManager @Inject constructor(
 
     // ---- session ----
 
-    private data class Target(val playlistId: String, val profileToken: String)
+    /** [routeGen] moves when a server address change lands, so the session restarts at the current address. */
+    private data class Target(val playlistId: String, val profileToken: String, val routeGen: Long = 0L)
     private val HOLD = Target("\u0000hold", "")
 
     /**
@@ -141,6 +142,8 @@ class DispatcharrSyncManager @Inject constructor(
         /** The live session, or a picker peek while no session runs (one writer at a time). */
         fun live(): Boolean = session === this || (peek && session == null)
         @Volatile var bound: Conn? = null
+        /** Retired by a server address change: it reads and writes nothing more (its connection is the old address). */
+        @Volatile var retired = false
         /** This session's App Data key, `<user>.aeriotv` (DsyncKeyName), once /me/ answered. */
         @Volatile var userKey: String? = null
         /** Keys deferred because their id cache was not built (DsyncReadiness), with the local row count waiting. */
@@ -170,6 +173,8 @@ class DispatcharrSyncManager @Inject constructor(
         /** The user chose Upload Again: the next pull seeds from local as a first read does. */
         @Volatile var missingUpload = false
         val serverBytes = HashMap<String, Long>()
+        /** Bucket wire name -> the server's value as the last refresh before a PUT read it (null = none there). */
+        val fetchedRaw = HashMap<String, JsonObject?>()
         /** Bucket wire name -> list `bytes` when that bucket was last fetched. */
         val fetchedBytes = HashMap<String, Long>()
         /** Categories present inside their v2 key on the server. */
@@ -222,6 +227,7 @@ class DispatcharrSyncManager @Inject constructor(
         }
         profileManager.get().onProfilesMutated = { pid, user, what, at -> onProfilesMutated(pid, user, what, at) }
         profileManager.get().onPickerOpened = { pid, reason -> onPickerOpened(pid, reason) }
+        profileManager.get().onRouteChange = { pid, landed -> onRouteChange(pid, landed) }
         registerNetworkCallback()
         watchBetweenSessions()
         scope.launch {
@@ -232,10 +238,11 @@ class DispatcharrSyncManager @Inject constructor(
                 // The picker reason only: an in-app PIN pad (Set Admin PIN, Add Profile)
                 // used to end the session here, and edits made under the pad had no session.
                 kotlinx.coroutines.flow.combine(profileManager.get().switching, com.aeriotv.android.core.app.LaunchWorkHold.pickerHold) { sw, held -> sw || held },
-            ) { dsyncOn, pid, token, switching ->
+                routeGen,
+            ) { dsyncOn, pid, token, switching, gen ->
                 // A profile switch (or the TV launch picker) is in flight: hold until its sign-in and
                 // permissions are in place (the scrim drops), then start.
-                if (switching) HOLD else if (dsyncOn && pid != null) Target(pid, token) else null
+                if (switching) HOLD else if (dsyncOn && pid != null) Target(pid, token, gen) else null
             }
                 .distinctUntilChanged()
                 .collectLatest { t ->
@@ -335,12 +342,13 @@ class DispatcharrSyncManager @Inject constructor(
     private fun onProfilesMutated(playlistId: String, username: String, what: String, stampAt: Long = 0L) {
         // Called from UI actions on the main thread: all disk work happens on IO.
         // A roster add keeps the row's own stamp (stampAt); every real edit stamps now.
-        if (what == "undo-add") {
-            // Roster undo: local only. No tombstone, no pending mark, no push;
-            // the server row the add came from stays as other devices wrote it.
+        if (what == "undo-add" || what == "local-remove") {
+            // Roster undo, or removing a profile held after a server change:
+            // local only. No tombstone, no pending mark, no push; the server
+            // row stays as other devices wrote it.
             rosterAdds.remove(rowKey(playlistId, username))
             state.edit().remove(rowKey(playlistId, username)).remove(customKey(playlistId, username)).commit()
-            Log.i(TAG, "[DSYNC] profiles: undo add $username; server row left as is")
+            Log.i(TAG, "[DSYNC] profiles: ${if (what == "undo-add") "undo add" else "removed held profile"} $username on this device only; server row left as is")
             return
         }
         val now = if (stampAt > 0) stampAt else System.currentTimeMillis() / 1000
@@ -481,6 +489,20 @@ class DispatcharrSyncManager @Inject constructor(
         return ok
     }
 
+    /**
+     * The user's App Data key names from the same list call [pullAll] makes
+     * (GET users/me/app-data/), or null when it could not be read.
+     */
+    private suspend fun listedKeys(s: Session): List<String>? {
+        val c = freshConn(s) ?: return null
+        val list = runCatching { client.appDataList(c.base, c.apiKey) }.getOrNull()
+        if (list == null || !list.ok) return null
+        return runCatching {
+            val root = json.parseToJsonElement(list.body.orEmpty()) as? JsonObject
+            (root?.get("apps") as? JsonArray)?.mapNotNull { (it as? JsonObject)?.get("key").asStr() }.orEmpty()
+        }.getOrNull()
+    }
+
     /** Playlist id -> the debounced no-session push. */
     private val peekPushJobs = HashMap<String, Job>()
 
@@ -524,6 +546,15 @@ class DispatcharrSyncManager @Inject constructor(
             val peek = Session(playlistId, profileKey, token, peek = true)
             if (!isAdmin(peek)) {
                 Log.i(TAG, "[DSYNC] profiles: no-session push skipped ($what): last-active profile cannot write profiles; kept for the next session")
+                return@withLock
+            }
+            // The list call a session starts with, before anything is read or
+            // written here: a legacy key listed means the next session must
+            // move it first. The pending mark stays set, so that session sends
+            // this change after its move.
+            val listed = listedKeys(peek)
+            if (!DsyncKeyName.noSessionPushAllowed(listed)) {
+                Log.i(TAG, "[DSYNC] profiles: no-session push left to the session ($what): ${if (listed == null) "key list not read" else "legacy keys listed"}")
                 return@withLock
             }
             Log.i(TAG, "[DSYNC] profiles: no-session push ($what) under the last-active profile")
@@ -795,7 +826,9 @@ class DispatcharrSyncManager @Inject constructor(
             val row = playlistDao.byId(playlistId) ?: return@withContext null
             val apiKey = row.apiKey?.takeIf { it.isNotBlank() } ?: return@withContext null
             val base = repository.get().effectiveBaseUrl(row)
-            val name = runCatching { client.fetchMe(base, apiKey) }.getOrNull()?.username.orEmpty()
+            val me = runCatching { client.fetchMe(base, apiKey) }.getOrNull()
+            me?.let { runCatching { profileManager.get().noteDefaultMe(playlistId, base, apiKey, it.id, it.username) } }
+            val name = me?.username.orEmpty()
             val main = DsyncKeyName.main(name) ?: return@withContext null
             var r = runCatching { client.appDataGet(base, apiKey, main) }.getOrNull()
                 ?: return@withContext null
@@ -828,7 +861,9 @@ class DispatcharrSyncManager @Inject constructor(
             val row = playlistDao.byId(playlistId) ?: return@withContext err
             val apiKey = row.apiKey?.takeIf { it.isNotBlank() } ?: return@withContext err
             val base = repository.get().effectiveBaseUrl(row)
-            val name = runCatching { client.fetchMe(base, apiKey) }.getOrNull()?.username.orEmpty()
+            val me = runCatching { client.fetchMe(base, apiKey) }.getOrNull()
+            me?.let { runCatching { profileManager.get().noteDefaultMe(playlistId, base, apiKey, it.id, it.username) } }
+            val name = me?.username.orEmpty()
             val main = DsyncKeyName.main(name) ?: return@withContext err
             for (key in listOf(main, DsyncKeyName.LEGACY_MAIN)) {
                 val r = runCatching { client.appDataGet(base, apiKey, key) }.getOrNull() ?: return@withContext err
@@ -975,10 +1010,13 @@ class DispatcharrSyncManager @Inject constructor(
         val item = com.aeriotv.android.core.sync.SyncItemCatalog.itemForDsync(key.suffix)
         val on = item == null || prefs.syncScopesOnce()[item.id] != com.aeriotv.android.core.sync.SyncScope.Off
         if (!on) return false
-        return when (key) {
+        val base = when (key) {
             DsyncKey.Profiles -> isAdmin(s)
             else -> true
         }
+        // `profiles` pauses in both directions while a profile on this
+        // playlist is held after a server change (A-APP-1 follow-up, item 4).
+        return com.aeriotv.android.core.profiles.RosterPause.syncs(key, base, profileManager.get().isRosterPaused(s.playlistId))
     }
 
     /**
@@ -1000,16 +1038,55 @@ class DispatcharrSyncManager @Inject constructor(
 
     /** The session's own credential, captured while its profile was active. */
     private suspend fun conn(s: Session): Conn? {
+        if (!addressSettled(s)) return null
         s.bound?.let { return it }
         if (ProfileScope.token.value != s.token) return null
         return freshConn(s)?.also { s.bound = it }
     }
 
     private suspend fun freshConn(s: Session): Conn? {
+        if (!addressSettled(s)) return null
         if (ProfileScope.token.value != s.token) return null
         val row = playlistDao.byId(s.playlistId) ?: return null
         val key = row.apiKey?.takeIf { it.isNotBlank() } ?: return null
         return Conn(repository.get().effectiveBaseUrl(row), key, row)
+    }
+
+    // ---- server address change (item 6 of the profile follow-ups) ----
+
+    /** Playlists whose server address is changing: no session or peek reads or writes for them until it lands. */
+    private val routeChanging = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val routeGen = MutableStateFlow(0L)
+
+    /** False while [s]'s playlist is moving, or once [s] was retired by a move: it then gets no connection. */
+    private fun addressSettled(s: Session): Boolean = !s.retired && s.playlistId !in routeChanging
+
+    /**
+     * A server address change on [playlistId] (ProfileManager, every path).
+     * Before anything goes to the new address: the saved server copy is
+     * dropped for every profile of the playlist, the live session (bound to
+     * the old address) is retired, and nothing reads or writes until it
+     * lands. When it lands: any copy saved meanwhile is dropped again and a
+     * new session starts at the playlist's current address, where the first
+     * sync reads before it writes. Local data and local change marks stay.
+     */
+    private fun onRouteChange(playlistId: String, landed: Boolean) {
+        if (!landed) {
+            routeChanging += playlistId
+            session?.takeIf { it.playlistId == playlistId }?.retired = true
+        }
+        val keys = DsyncServerCopy.keys(state.all.keys, playlistId)
+        if (keys.isNotEmpty()) {
+            val e = state.edit()
+            keys.forEach { e.remove(it) }
+            e.commit()
+        }
+        if (!landed) {
+            Log.i(TAG, "[PROFILE-HOST] sync copy discarded playlist=${playlistId.take(8)}")
+            return
+        }
+        routeChanging -= playlistId
+        if (lastTarget?.playlistId == playlistId) routeGen.value = routeGen.value + 1
     }
 
     // ---- persisted per (playlist, profile, key) state ----
@@ -1063,7 +1140,11 @@ class DispatcharrSyncManager @Inject constructor(
     /** Reads the signed-in username once per session (GET users/me/) and names the key from it. */
     private suspend fun ensureUserKey(s: Session, c: Conn): Boolean {
         if (s.userKey != null) return true
-        val name = runCatching { client.fetchMe(c.base, c.apiKey) }.getOrNull()?.username.orEmpty()
+        val me = runCatching { client.fetchMe(c.base, c.apiKey) }.getOrNull()
+        // The default profile's session: its users/me is recorded, or is the
+        // same-server check after an address change (A-APP-1).
+        if (me != null && s.token.isEmpty()) runCatching { profileManager.get().noteDefaultMe(s.playlistId, c.base, c.apiKey, me.id, me.username) }
+        val name = me?.username.orEmpty()
         val main = DsyncKeyName.main(name) ?: run {
             Log.w(TAG, "[DSYNC] username not read; sync waits for the next attempt")
             return false
@@ -1620,6 +1701,11 @@ class DispatcharrSyncManager @Inject constructor(
         // No byte guard before the PUT: send the full value; trim only on a 413.
         var value = DsyncV2.encodeBucket(bucketRaw(s, b), deviceId, BuildConfig.VERSION_NAME, now, mapOf(key to sub))
         value = withProviders(s, value)
+        // Roster paused: `profiles` goes up exactly as the server holds it now
+        // (or not at all), never local rows or a copy saved from an earlier server.
+        if (profileManager.get().isRosterPaused(s.playlistId)) {
+            value = com.aeriotv.android.core.profiles.RosterPause.withServerProfiles(value, s.fetchedRaw[wire(s, b)])
+        }
         var step = 0
         while (true) {
             when (put(s, c, b, key, value, data)) {
@@ -1703,10 +1789,11 @@ class DispatcharrSyncManager @Inject constructor(
         val f = fetchBucket(c, wire(s, b))
         val got = when (f) {
             Fetched.Failed -> return Refresh.Unreachable
-            Fetched.Absent, Fetched.Malformed -> return Refresh.Ok
+            Fetched.Absent, Fetched.Malformed -> { s.fetchedRaw[wire(s, b)] = null; return Refresh.Ok }
             is Fetched.TooNew -> { s.blocked += b.keys; return Refresh.RemoteTook }
             is Fetched.Got -> f
         }
+        s.fetchedRaw[wire(s, b)] = got.bucket.raw
         saveBucketRaw(s, b, got.bucket.raw)
         s.serverBytes[wire(s, b)] = got.bytes.toLong()
         foldProviders(s, got.bucket)

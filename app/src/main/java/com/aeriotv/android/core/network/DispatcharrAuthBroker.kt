@@ -86,8 +86,13 @@ class DispatcharrAuthBroker @Inject constructor(
             Log.i(TAG, "[AUTH] stream 401 for ${row.id.take(8)}: re-signed in; the stream retries with the new key")
             return com.aeriotv.android.core.playback.StreamAuth.Outcome.Retry(fresh)
         }
-        gateRejectedKey(row, key, passwordToo = hasPassword)
-        Log.w(TAG, "[AUTH] stream 401 for ${row.id.take(8)}: key rejected${if (hasPassword) ", re-sign-in refused" else ""}; held, stream stopped")
+        val noKey = DispatcharrLoginGate.accountHasNoKey(loginSlot(row))
+        gateRejectedKey(row, key, passwordToo = hasPassword, noApiKey = noKey)
+        Log.w(
+            TAG,
+            "[AUTH] stream 401 for ${row.id.take(8)}: key rejected" +
+                (if (noKey) ", re-sign-in found no API key" else if (hasPassword) ", re-sign-in refused" else "") + "; held, stream stopped",
+        )
         return com.aeriotv.android.core.playback.StreamAuth.Outcome.Held
     }
 
@@ -104,7 +109,10 @@ class DispatcharrAuthBroker @Inject constructor(
 
     private suspend fun loadRow(playlistId: String): PlaylistEntity? {
         startInvalidator()
-        val token = com.aeriotv.android.core.profiles.ProfileScope.token.value
+        // Per identity this read carries (a default-only caller reads the
+        // playlist's own row even while a profile is installed): one
+        // identity's cached key never serves another (2026-11-12).
+        val token = com.aeriotv.android.core.profiles.ProfileScope.readScope(playlistId)
         rowCache[playlistId]?.takeIf { it.token == token }?.let { return it.row }
         val row = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { dao.byId(playlistId) }
             ?: return null
@@ -202,13 +210,23 @@ class DispatcharrAuthBroker @Inject constructor(
             }
             if (freshKey == null) {
                 // A password playlist whose re-login was itself refused
-                // (DispatcharrLoginGate parks it): the same hold, or the
-                // re-login would run again every minute.
-                if (keyRejected && DispatcharrLoginGate.isRejected(playlistId)) {
-                    gateRejectedKey(playlist, initialKey, passwordToo = true)
-                    throw DispatcharrError.KeyRejected()
+                // (DispatcharrLoginGate parks it), or signed in to an account
+                // with no API key (removed on the server; 2026-11-11, Apple
+                // parity): the same hold, or every caller would keep sending
+                // the dead key, which counts toward Dispatcharr's failed-key
+                // lockout for the whole network. The held key's re-check is
+                // then one re-login now and then, never a key request.
+                when (reloginHold(keyRejected, DispatcharrLoginGate.isRejected(loginSlot(playlist)), DispatcharrLoginGate.accountHasNoKey(loginSlot(playlist)))) {
+                    ReloginHold.NoApiKey -> {
+                        gateRejectedKey(playlist, initialKey, passwordToo = true, noApiKey = true)
+                        throw DispatcharrError.KeyRejected()
+                    }
+                    ReloginHold.PasswordRefused -> {
+                        gateRejectedKey(playlist, initialKey, passwordToo = true)
+                        throw DispatcharrError.KeyRejected()
+                    }
+                    ReloginHold.None -> throw e
                 }
-                throw e
             }
             block(freshKey)
         }
@@ -222,8 +240,10 @@ class DispatcharrAuthBroker @Inject constructor(
         return currentKeyAfterSwap(usedKey, current, DispatcharrRequestGate::isKeyRejected)
     }
 
-    private fun gateRejectedKey(playlist: PlaylistEntity, key: String, passwordToo: Boolean) {
-        if (DispatcharrRequestGate.markKeyRejected(playlist.id, key, playlist.name, passwordToo, baseUrl = playlist.urlString)) {
+    private fun gateRejectedKey(playlist: PlaylistEntity, key: String, passwordToo: Boolean, noApiKey: Boolean = false) {
+        // Held for the identity the key is (the playlist's own, or a profile's).
+        val profileId = com.aeriotv.android.core.profiles.ProfileScope.signInIdentity(playlist.id, playlist.username)
+        if (DispatcharrRequestGate.markKeyRejected(playlist.id, key, playlist.name, passwordToo, baseUrl = playlist.urlString, noApiKey = noApiKey, profileId = profileId)) {
             Log.w(
                 TAG,
                 "[AUTH] API key for ${playlist.id.take(8)} rejected by the server; holding every API call " +
@@ -264,12 +284,18 @@ class DispatcharrAuthBroker @Inject constructor(
             Log.i(TAG, "silentRebootstrap SKIP: playlist ${playlist.id.take(8)} has no creds (API Key mode)")
             return null
         }
-        // One attempt per playlist per 60 s, shared by concurrent callers;
-        // 429 and rejected logins park (DispatcharrLoginGate).
-        return DispatcharrLoginGate.silentRelogin(playlist.id) {
+        // One attempt per identity per 60 s, shared by concurrent callers
+        // signing in as the same user; 429 and rejected logins park
+        // (DispatcharrLoginGate). A non-default profile re-logs in only with
+        // its own stored password, never the playlist's.
+        return DispatcharrLoginGate.silentRelogin(loginSlot(playlist)) {
             rebootstrapOnce(playlist, username, password)
         }
     }
+
+    /** The re-login slot for [row]: the identity its sign-in belongs to (DispatcharrLoginGate.slotFor). */
+    fun loginSlot(row: PlaylistEntity): String =
+        DispatcharrLoginGate.slotFor(row.id, com.aeriotv.android.core.profiles.ProfileScope.signInIdentity(row.id, row.username))
 
     private suspend fun rebootstrapOnce(
         playlist: PlaylistEntity,
@@ -279,16 +305,33 @@ class DispatcharrAuthBroker @Inject constructor(
         return try {
             // Re-read the row: a caller that waited may hold a stale copy.
             val row = dao.byId(playlist.id) ?: playlist
+            // A profile switch since the caller read its row: the row now
+            // carries another identity, and that identity's key must never be
+            // replaced with this account's (2026-11-12, security).
+            if (!row.username.orEmpty().trim().equals(username.trim(), ignoreCase = true)) {
+                Log.i(TAG, "silentRebootstrap SKIP for ${playlist.id.take(8)}: the active profile changed since the call started")
+                return null
+            }
             val pair = client.login(row.urlString, username, password)
             tokenStore.store(row.id, pair.access, pair.refresh)
             val newKey = client.fetchCurrentUserApiKey(row.urlString, pair.access)
-            dao.update(row.copy(apiKey = newKey))
-            // Sync: the re-issued key is this playlist's newest sign-in change here.
-            com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, row.id)
-            // Requests already built with the old key go out with the new one.
-            row.apiKey?.let { DispatcharrRequestGate.noteKeyReplaced(it, newKey) }
-            invalidateRow(row.id)
-            Log.i(TAG, "silentRebootstrap OK for ${playlist.id.take(8)}")
+            // The startup login runs this too (one login per launch): an
+            // unchanged key writes nothing, so a launch never looks like a
+            // sign-in change to sync.
+            if (reloginChangesKey(row.apiKey, newKey)) {
+                dao.update(row.copy(apiKey = newKey))
+                // Sync: the re-issued key is this playlist's newest sign-in
+                // change here (a profile's own key is not the playlist's).
+                if (com.aeriotv.android.core.profiles.ProfileScope.signInIdentity(row.id, row.username) == null) {
+                    com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, row.id)
+                }
+                // Requests already built with the old key go out with the new one.
+                row.apiKey?.let { DispatcharrRequestGate.noteKeyReplaced(it, newKey) }
+                invalidateRow(row.id)
+                Log.i(TAG, "silentRebootstrap OK for ${playlist.id.take(8)}: the account's key changed; saved")
+            } else {
+                Log.i(TAG, "silentRebootstrap OK for ${playlist.id.take(8)}: key unchanged")
+            }
             newKey
         } catch (c: kotlinx.coroutines.CancellationException) {
             // A cancelled caller (a sweep preempted by a playlist switch, the
@@ -299,6 +342,9 @@ class DispatcharrAuthBroker @Inject constructor(
         } catch (e: DispatcharrError.InvalidCredentials) {
             Log.w(TAG, "silentRebootstrap FAIL for ${playlist.id.take(8)}: ${e.message}")
             throw e // the gate parks the playlist and surfaces it once
+        } catch (e: DispatcharrError.NoApiKey) {
+            Log.w(TAG, "silentRebootstrap for ${playlist.id.take(8)}: signed in, but the account has no API key")
+            throw e // the gate records it; the caller holds the key
         } catch (t: Throwable) {
             Log.w(TAG, "silentRebootstrap FAIL for ${playlist.id.take(8)}: ${t.message}")
             null
@@ -309,3 +355,29 @@ class DispatcharrAuthBroker @Inject constructor(
         const val TAG = "DispatcharrAuthBroker"
     }
 }
+
+/** What a failed silent re-login means for the key that was refused. */
+internal enum class ReloginHold {
+    /** Not known to be dead: leave the 401 to the caller. */
+    None,
+    /** The stored password was refused too. */
+    PasswordRefused,
+    /** The re-login signed in, but the account has no API key: every key is dead. */
+    NoApiKey,
+}
+
+/**
+ * Pure rule after a re-login returned no key: an account with no API key
+ * holds the key whatever the probe said (signing in proved the account, and
+ * it has no key at all); a refused password holds it when the probe also
+ * rejected the key; anything else (a network failure) does not.
+ */
+internal fun reloginHold(keyRejected: Boolean, loginRejected: Boolean, accountHasNoKey: Boolean): ReloginHold = when {
+    accountHasNoKey -> ReloginHold.NoApiKey
+    keyRejected && loginRejected -> ReloginHold.PasswordRefused
+    else -> ReloginHold.None
+}
+
+/** A re-login's key replaces the stored one only when it differs (blank stored = differs). */
+internal fun reloginChangesKey(stored: String?, fromServer: String): Boolean =
+    stored?.trim()?.takeIf { it.isNotEmpty() } != fromServer.trim()

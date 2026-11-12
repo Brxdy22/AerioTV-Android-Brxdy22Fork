@@ -192,6 +192,9 @@ class PlaylistRepository @Inject constructor(
     private val vodCatalogStore: com.aeriotv.android.core.data.vod.VodCatalogStore,
     private val vodSnapshotStore: com.aeriotv.android.core.preferences.VodLibrarySnapshotStore,
     private val snapshotStamps: com.aeriotv.android.core.profiles.ChannelSnapshotStamps,
+    // Profile sign-ins held across a server address change (A-APP-1).
+    // Provider: ProfileManager depends on this class.
+    private val profileManager: javax.inject.Provider<com.aeriotv.android.core.profiles.ProfileManager>,
 ) {
 
     /** Last successful cast-profile re-resolve per playlist id, so the launch
@@ -218,7 +221,9 @@ class PlaylistRepository @Inject constructor(
             playlist.urlString.takeIf { it.isNotBlank() },
             playlist.lanUrlString?.takeIf { it.isNotBlank() },
         )
-        activeCredentials.set(prefixes, playlist.apiKey)
+        // The active profile's key, never the playlist's own while another
+        // profile is installed (a sign-in written under defaultOnly).
+        activeCredentials.set(prefixes, com.aeriotv.android.core.profiles.ProfileScope.activeKeyFor(playlist.id, playlist.apiKey))
     }
 
     /**
@@ -387,6 +392,11 @@ class PlaylistRepository @Inject constructor(
      * for it before anything fails.
      */
     suspend fun refreshDispatcharrSession(playlistId: String): Result<Boolean> {
+        // Item 13: Edit Playlist's Refresh Session is for the playlist's OWN
+        // sign-in. With a non-default profile active here, that sign-in is
+        // refreshed on the playlist's own row and its token is not kept (the
+        // session belongs to the active profile, whose sign-in stays as is).
+        if (com.aeriotv.android.core.profiles.ProfileScope.overlayFor(playlistId) != null) return refreshOwnSignIn(playlistId)
         val playlist = dao.byId(playlistId)
             ?: return Result.failure(IllegalStateException("Playlist not found."))
         val previousKey = playlist.apiKey?.trim().orEmpty()
@@ -396,6 +406,33 @@ class PlaylistRepository @Inject constructor(
         val fresh = dispatcharrAuth.silentRebootstrapApiKey(playlist)
             ?: return Result.failure(IllegalStateException("Refresh failed. Check the URL and credentials."))
         return Result.success(fresh.trim() != previousKey)
+    }
+
+    /** [refreshDispatcharrSession] for the playlist's own sign-in while a non-default profile is active. */
+    private suspend fun refreshOwnSignIn(playlistId: String): Result<Boolean> = runCatching {
+        withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: throw IllegalStateException("Playlist not found.")
+            val user = row.username?.trim()?.takeIf { it.isNotBlank() }
+            val pass = row.password?.takeIf { it.isNotBlank() }
+            if (user == null || pass == null) throw IllegalStateException("Username and password required.")
+            val base = row.urlString.trimEnd('/')
+            val key = try {
+                val jwt = dispatcharrClient.login(base, user, pass)
+                dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                throw c
+            } catch (t: Throwable) {
+                Log.w(TAG_SAVE, "[PROFILE] own sign-in refresh failed for ${playlistId.take(8)}: ${t.javaClass.simpleName}")
+                throw IllegalStateException("Refresh failed. Check the URL and credentials.")
+            }
+            val rotated = key.trim() != row.apiKey?.trim().orEmpty()
+            if (rotated) {
+                dao.update(row.copy(apiKey = key))
+                com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, playlistId)
+            }
+            Log.i(TAG_SAVE, "[PROFILE] own sign-in refreshed for ${playlistId.take(8)}: key ${if (rotated) "replaced" else "unchanged"}")
+            rotated
+        }
     }
 
     /** Any saved playlist by id, active or not (Edit Playlist on a non-active row). */
@@ -496,6 +533,143 @@ class PlaylistRepository @Inject constructor(
     }
 
     /**
+     * Fix Login on the receiving TV (docs/DeviceSetupHandoff.md): another
+     * device handed over [playlistId]'s sign-in. Writes only the sign-in
+     * fields of the playlist's own row (the default profile's login, as
+     * Dispatcharr Sync's credential apply does): the API key, and the
+     * username and password when sent. Nothing else on the row, no profile,
+     * and no other playlist changes. Then the rejected-key hold and its
+     * prompt are lifted, and requests or streams still built with the old
+     * key go out with the new one. The caller reloads the channels.
+     * Fails with [NoSuchElementException] when the playlist is not here and
+     * [IllegalArgumentException] when nothing to sign in with was sent.
+     */
+    suspend fun applyHandedSignIn(
+        playlistId: String,
+        sent: com.aeriotv.android.core.setup.SetupProtocol.Credential?,
+    ): Result<PlaylistEntity> = runCatching {
+        // Item 11: verify the sent sign-in at the playlist's address and
+        // reconnect only the playlist's current account; nothing is written
+        // for another (the caller shows Fix Login's existing failure line).
+        kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: throw NoSuchElementException("playlist not here")
+            requireSameAccount(playlistId, row, verifySentSignIn(row, sent))
+        }
+        writeSignIn(playlistId, sent, "fix login")
+    }
+
+    /** users/me for a sign-in sent by Fix Login, at [row]'s address: with the sent key, else a login with the sent password. */
+    private suspend fun verifySentSignIn(
+        row: PlaylistEntity,
+        sent: com.aeriotv.android.core.setup.SetupProtocol.Credential?,
+    ): com.aeriotv.android.core.network.MeResponse {
+        val base = row.urlString.trimEnd('/')
+        sent?.apiKey?.trim()?.takeIf { it.isNotEmpty() }?.let { key ->
+            return dispatcharrClient.fetchMe(base, key)
+                ?: throw com.aeriotv.android.core.network.DispatcharrError.InvalidCredentials("The sent sign-in was not accepted.")
+        }
+        val user = sent?.username?.trim()?.takeIf { it.isNotEmpty() }
+        val pass = sent?.password?.takeIf { it.isNotEmpty() }
+        if (user == null || pass == null) throw IllegalArgumentException("no sign-in sent")
+        val jwt = dispatcharrClient.login(base, user, pass)
+        val key = dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
+        return dispatcharrClient.fetchMe(base, key)
+            ?: throw com.aeriotv.android.core.network.DispatcharrError.InvalidCredentials("The sent sign-in was not accepted.")
+    }
+
+    /**
+     * Item 11: a sign-in reconnects only [playlistId]'s current account
+     * ([com.aeriotv.android.core.setup.FixLogin.knownAccount]: the recorded
+     * default identity, else the row's own username, else the default
+     * profile's; the recorded id whenever there is one); with none, a Child
+     * is refused. A mismatch throws InvalidCredentials, which the
+     * sign-in form shows as its existing "did not accept" line.
+     */
+    private suspend fun requireSameAccount(playlistId: String, row: PlaylistEntity, me: com.aeriotv.android.core.network.MeResponse) {
+        val profiles = profileManager.get()
+        val known = com.aeriotv.android.core.setup.FixLogin.knownAccount(
+            profiles.recordedDefaultIdentity(playlistId),
+            row.username,
+            profiles.defaultProfileUsername(playlistId),
+        )
+        if (!com.aeriotv.android.core.setup.FixLogin.sameAccount(known.username, known.userId, me.username, me.id, profiles.childInvolved(playlistId))) {
+            Log.w("DispatcharrAuthBroker", "[AUTH] sign-in for ${playlistId.take(8)} refused: not the playlist's current account")
+            throw com.aeriotv.android.core.network.DispatcharrError.InvalidCredentials("Dispatcharr did not accept that username or password.")
+        }
+    }
+
+    /**
+     * The rejected-key prompt's sign-in form: log in to [playlistId]'s server
+     * with [username] and [password] (the existing login path, so the login
+     * throttle and its 429 copy apply), read the account's current API key
+     * from users/me (never generated here), and save the key, username, and
+     * password as the playlist's own sign-in (credentials only), then lift
+     * the hold and the prompt like [applyHandedSignIn]. The stored password
+     * lets a later key change heal through the silent re-login. Throws the
+     * login's own errors ([DispatcharrError.InvalidCredentials],
+     * [DispatcharrError.LoginThrottled], [DispatcharrError.NoApiKey], a
+     * transport error). Never logs the password or the key.
+     */
+    suspend fun signInWithPassword(playlistId: String, username: String, password: String): Result<PlaylistEntity> = runCatching {
+        kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: throw NoSuchElementException("playlist not here")
+            val base = row.urlString.trimEnd('/')
+            val user = username.trim()
+            val jwt = dispatcharrClient.login(base, user, password)
+            val key = dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
+            // Item 11: only the playlist's current account reconnects. On a
+            // mismatch nothing is written and the token is dropped unused.
+            val me = dispatcharrClient.fetchMe(base, key)
+                ?: throw com.aeriotv.android.core.network.DispatcharrError.Transport("Could not read the account.")
+            requireSameAccount(playlistId, row, me)
+            val updated = writeSignIn(
+                playlistId,
+                com.aeriotv.android.core.setup.SetupProtocol.Credential(apiKey = key, username = user, password = password),
+                "sign-in",
+            )
+            // After the write: a changed account drops the old pair there.
+            dispatcharrTokenStore.store(playlistId, jwt.access, jwt.refresh)
+            com.aeriotv.android.core.network.DispatcharrLoginGate.reset(playlistId)
+            updated
+        }
+    }
+
+    /**
+     * Writes only the sign-in fields of the playlist's own row (the default
+     * profile's login, as Dispatcharr Sync's credential apply does): the API
+     * key, and the username and password when sent. Nothing else on the row,
+     * no profile, and no other playlist changes. Then the rejected-key hold
+     * and its prompt are lifted, and requests or streams still built with the
+     * old key go out with the new one. The caller reloads the channels.
+     */
+    private suspend fun writeSignIn(
+        playlistId: String,
+        sent: com.aeriotv.android.core.setup.SetupProtocol.Credential?,
+        why: String,
+    ): PlaylistEntity =
+        kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: throw NoSuchElementException("playlist not here")
+            val next = com.aeriotv.android.core.setup.FixLogin.signInToWrite(row.apiKey, row.username, row.password, sent)
+                ?: throw IllegalArgumentException("no sign-in sent")
+            val updated = row.copy(apiKey = next.apiKey, username = next.username, password = next.password)
+            dao.update(updated)
+            if (next.accountChanged) dispatcharrTokenStore.clear(playlistId)
+            // Sync: this playlist's newest sign-in change is here now.
+            com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, playlistId)
+            val oldKey = row.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+            val newKey = next.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+            com.aeriotv.android.core.setup.FixLogin.liftHold(playlistId, oldKey, newKey)
+            dispatcharrAuth.invalidateRow(playlistId)
+            if (updated.isActive) publishActiveCredentials(updated)
+            Log.i(
+                "AerioSetup",
+                "[SETUP] $why applied to ${playlistId.take(8)}: key ${if (newKey != oldKey) "replaced" else "unchanged"}" +
+                    (if (next.accountChanged) ", username or password updated" else "") + "; hold lifted",
+            )
+            updated
+        }
+
+    /**
      * The instant Edit Playlist save: write the edited fields to the existing
      * row and nothing else. No login, no channel fetch, no capability probe, no
      * [SaveStage.Finishing] work, so no loading screen either.
@@ -509,8 +683,14 @@ class PlaylistRepository @Inject constructor(
         request: SaveRequest,
         existingId: String,
         plan: EditPlan,
-    ): Result<PlaylistEntity> = runCatching {
+    ): Result<PlaylistEntity> {
+        var routeMoved = false
+        return runCatching {
         val startedAt = System.currentTimeMillis()
+        // A Local URL edit can move the playlist to another host: profile
+        // sign-ins are held before the row changes (A-APP-1), and the row is
+        // read after that, with the playlist's own sign-in.
+        if (plan.lanUrlChanged) routeMoved = holdProfileSignInsForSave(request, existingId).second
         val previous = dao.byId(existingId)
             ?: throw IllegalStateException("Playlist not found.")
         val normalisedBase = request.url.trimEnd('/')
@@ -553,10 +733,12 @@ class PlaylistRepository @Inject constructor(
                 "vodOff=${plan.vodTurnedOff} ua=${plan.userAgentChanged}",
         )
         updated
-    }.onFailure { Log.w(TAG_SAVE, "plan=InstantUpdate failed", it) }
+        }.onFailure { Log.w(TAG_SAVE, "plan=InstantUpdate failed", it) }
+            .also { if (routeMoved || plan.lanUrlChanged) runCatching { profileManager.get().routeChangeSettled(existingId, reloadUi = true) } }
+    }
 
     suspend fun loadAndPersist(
-        request: SaveRequest,
+        saveRequest: SaveRequest,
         existingId: String? = null,
         /**
          * Called as each [SaveStage] begins, on the calling coroutine's
@@ -571,6 +753,17 @@ class PlaylistRepository @Inject constructor(
          */
         onPlan: ((SavePlan) -> Unit)? = null,
     ): Result<Pair<PlaylistEntity, List<M3UChannel>>> {
+        // A new address for an existing playlist: profile sign-ins are held
+        // before this save sends anything (A-APP-1).
+        val (request, routeMoved) = try {
+            holdProfileSignInsForSave(saveRequest, existingId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            // A change that had started is closed again (nothing was saved).
+            existingId?.let { runCatching { profileManager.get().routeChangeSettled(it, reloadUi = true) } }
+            return Result.failure(t)
+        }
         // Where the seconds go, per stage, so a slow save can be attributed
         // (Logan 2026-09-18: "a successful save takes several seconds"). No
         // credential values are ever logged.
@@ -618,7 +811,11 @@ class PlaylistRepository @Inject constructor(
         // the user acting on a key or credentials: lift any local "this key
         // was rejected" hold so the save really asks the server once.
         existingId?.let { com.aeriotv.android.core.network.DispatcharrRequestGate.clearPlaylist(it) }
+        // Only the playlist's own key: a save that runs as the active profile
+        // (Edit Playlist, item 13) carries that profile's unchanged key, which
+        // stays held until the profile's own sign-in is repaired.
         request.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+            ?.takeIf { existingId == null || com.aeriotv.android.core.profiles.ProfileScope.signInIdentity(existingId, request.username) == null }
             ?.let { com.aeriotv.android.core.network.DispatcharrRequestGate.clearKey(it) }
         return runCatching {
         val normalisedBase = request.url.trimEnd('/')
@@ -1032,6 +1229,10 @@ class PlaylistRepository @Inject constructor(
         entity to channels
         }.also { result ->
             closeStages(if (result.isSuccess) "ok" else "failed")
+            // The saved result reloads the screen; a failed save put the row back, so reload it here.
+            if (routeMoved && existingId != null) {
+                runCatching { profileManager.get().routeChangeSettled(existingId, reloadUi = result.isFailure) }
+            }
         }
     }
 
@@ -1067,20 +1268,36 @@ class PlaylistRepository @Inject constructor(
      * stored key turned out to belong to somebody else.
      */
     /** "scheme://host:port", lowercased, default port filled in; "" when blank or unparseable. */
-    private fun hostKey(raw: String?): String {
-        var v = raw?.trim().orEmpty()
-        if (v.isEmpty()) return ""
-        if (!v.startsWith("http://", true) && !v.startsWith("https://", true)) v = "http://$v"
-        val uri = runCatching { java.net.URI(v) }.getOrNull() ?: return ""
-        val host = uri.host?.lowercase()?.takeIf { it.isNotBlank() } ?: return ""
-        val scheme = (uri.scheme ?: "http").lowercase()
-        val port = if (uri.port > 0) uri.port else if (scheme == "https") 443 else 80
-        return "$scheme://$host:$port"
-    }
+    private fun hostKey(raw: String?): String = com.aeriotv.android.core.profiles.ProfileHostHold.routeKey(raw)
 
     /** True when either route of the playlist now points at another host, scheme, or port. */
     private fun hostChanged(oldBase: String?, newBase: String?, oldLan: String?, newLan: String?): Boolean =
-        hostKey(oldBase) != hostKey(newBase) || hostKey(oldLan) != hostKey(newLan)
+        com.aeriotv.android.core.profiles.ProfileHostHold.routeChanged(oldBase, newBase, oldLan, newLan)
+
+    /**
+     * A save that moves [existingId] to another scheme, host, or port
+     * (A-APP-1): BEFORE it sends anything, every non-default profile's stored
+     * sign-in for the playlist is held and a held active profile is left for
+     * the default one. Edit Playlist shows the playlist's own sign-in (item
+     * 13); a request that still carries a held profile's sign-in goes out
+     * with the playlist's own one instead. Returns the request to save and
+     * whether the route moved.
+     */
+    private suspend fun holdProfileSignInsForSave(incoming: SaveRequest, existingId: String?): Pair<SaveRequest, Boolean> {
+        val id = existingId ?: return incoming to false
+        val before = dao.byId(id) ?: return incoming to false
+        val newBase = incoming.url.trimEnd('/')
+        if (!hostChanged(before.urlString, newBase, before.lanUrlString, incoming.lanUrl)) return incoming to false
+        val profiles = profileManager.get()
+        if (!profiles.holdSignInsForRouteChange(id, before.urlString, before.lanUrlString, newBase, incoming.lanUrl)) return incoming to true
+        val own = kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) { dao.byId(id) } ?: before
+        val signIn = com.aeriotv.android.core.profiles.ProfileHostHold.scrub(
+            com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(incoming.apiKey, incoming.username, incoming.password),
+            com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(own.apiKey, own.username, own.password),
+            profiles.heldSignIns(id),
+        )
+        return incoming.copy(apiKey = signIn.apiKey, username = signIn.username, password = signIn.password) to true
+    }
 
     /**
      * Forget everything learned against a playlist's OLD host after an edit
@@ -1146,28 +1363,92 @@ class PlaylistRepository @Inject constructor(
         // the last good snapshot when a probe FAILS, which is right when the
         // account is unchanged and wrong here: a failed probe must not leave
         // the previous user's DVR / VOD / catch-up grants in force.
-        runCatching {
-            dao.update(
-                priorRow.copy(
-                    dispatcharrUserLevel = 10,
-                    dispatcharrIsStaff = false,
-                    dispatcharrIsSuperuser = false,
-                    dispatcharrCustomProperties = "",
-                    dispatcharrCapabilitiesFetchedAt = 0L,
-                    dispatcharrCapabilitiesSchema = 0,
-                    dispatcharrCapabilitiesStale = true,
-                    dispatcharrSystemCatchupEnabled = -1,
-                    dispatcharrDvrAccess = "",
-                    dispatcharrCatchupEnabled = true,
-                    dispatcharrVodMoviesEnabled = true,
-                    dispatcharrVodSeriesEnabled = true,
-                    dispatcharrAccountProfileIds = "",
-                ),
-            )
-        }.onFailure { Log.w(TAG_CAPS, "cached-identity reset failed", it) }
+        runCatching { dao.update(priorRow.withoutCachedIdentity()) }
+            .onFailure { Log.w(TAG_CAPS, "cached-identity reset failed", it) }
         // The display-only facts describe the OLD account; drop them with it.
         runCatching { appPreferences.clearDispatcharrAccountFacts(priorRow.id) }
             .onFailure { Log.w(TAG_CAPS, "account facts reset failed", it) }
+    }
+
+    /** The row with its per-user capability snapshot reset to unknown (a new account's is read by the next probe). */
+    private fun PlaylistEntity.withoutCachedIdentity(): PlaylistEntity = copy(
+        dispatcharrUserLevel = 10,
+        dispatcharrIsStaff = false,
+        dispatcharrIsSuperuser = false,
+        dispatcharrCustomProperties = "",
+        dispatcharrCapabilitiesFetchedAt = 0L,
+        dispatcharrCapabilitiesSchema = 0,
+        dispatcharrCapabilitiesStale = true,
+        dispatcharrSystemCatchupEnabled = -1,
+        dispatcharrDvrAccess = "",
+        dispatcharrCatchupEnabled = true,
+        dispatcharrVodMoviesEnabled = true,
+        dispatcharrVodSeriesEnabled = true,
+        dispatcharrAccountProfileIds = "",
+    )
+
+    /**
+     * Item 13 (Apple parity): the playlist's own sign-in typed into Edit
+     * Playlist while a non-default profile is active on it. That save runs as
+     * the active profile (its channels, its session), so the own sign-in is
+     * checked against the server here first, on the playlist's own row: null
+     * when it is unchanged, else the verified sign-in for [writeOwnSignIn]
+     * once the rest of the edit has saved. A login's token is never stored
+     * (the session belongs to the active profile). Throws the login's or the
+     * key check's own errors, so the form shows its usual Save Failed line.
+     */
+    suspend fun verifyOwnSignIn(playlistId: String, request: SaveRequest): OwnSignIn? =
+        withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: throw IllegalStateException("Playlist not found.")
+            val own = com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(row.apiKey, row.username, row.password)
+            val typed = com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(request.apiKey, request.username, request.password)
+            if (!com.aeriotv.android.core.profiles.EditPlaylistSignIn.ownChanged(typed, own)) return@withContext null
+            val base = request.url.trimEnd('/')
+            val typedKey = typed.apiKey?.trim()?.takeIf { it.isNotBlank() }
+            val key = if (request.sourceType == SourceType.DispatcharrUserPass && typedKey == null) {
+                val user = typed.username?.trim()?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("Username is required")
+                val pass = typed.password?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("Password is required")
+                val jwt = dispatcharrClient.login(base, user, pass)
+                dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
+            } else {
+                val k = typedKey ?: throw IllegalArgumentException("API key is required")
+                dispatcharrClient.verifyConnection(base, k)
+                k
+            }
+            val me = runCatching { dispatcharrClient.fetchMe(base, key) }.getOrNull()
+            OwnSignIn(com.aeriotv.android.core.profiles.EditPlaylistSignIn.ownAfter(typed, key, own), base, me)
+        }
+
+    /** A verified own sign-in from [verifyOwnSignIn]: [base] and users/me are where and who it signed in as. */
+    class OwnSignIn(
+        val signIn: com.aeriotv.android.core.profiles.ProfileHostHold.SignIn,
+        val base: String,
+        val me: com.aeriotv.android.core.network.MeResponse?,
+    )
+
+    /**
+     * Item 13: write a verified own sign-in to the playlist's own row only
+     * (never a profile's, never diverted). A changed account resets the
+     * row's capability snapshot (the default profile's) so its next probe
+     * reads the new account's; the active profile's session, token, and
+     * snapshot are untouched. Sync sees a sign-in change here.
+     */
+    suspend fun writeOwnSignIn(playlistId: String, verified: OwnSignIn) {
+        withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            val row = dao.byId(playlistId) ?: return@withContext
+            val s = verified.signIn
+            val accountChanged = !s.username.orEmpty().trim().equals(row.username.orEmpty().trim(), ignoreCase = true) ||
+                s.apiKey?.trim() != row.apiKey?.trim()
+            val base = if (accountChanged) row.withoutCachedIdentity() else row
+            dao.update(base.copy(apiKey = s.apiKey, username = s.username, password = s.password))
+            com.aeriotv.android.core.sync.SyncStamps.touched(com.aeriotv.android.core.sync.SyncStamps.Cat.Credentials, playlistId)
+            val key = s.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+            val me = verified.me
+            if (key != null && me != null) {
+                runCatching { profileManager.get().noteDefaultMe(playlistId, verified.base, key, me.id, me.username) }
+            }
+            Log.i(TAG_SAVE, "[PROFILE] Edit Playlist saved the playlist's own sign-in for ${playlistId.take(8)}; the active profile's is unchanged")
+        }
     }
 
     /**
@@ -1251,9 +1532,11 @@ class PlaylistRepository @Inject constructor(
         if (!force && !playlist.capabilitiesNeedProbe()) return false
         val base = effectiveBaseUrl(playlist)
         val key = playlist.apiKey?.takeIf { it.isNotBlank() }
+        var usedKey: String? = null
         val snapshot = key?.let {
             runCatching {
                 dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                    usedKey = k
                     dispatcharrClient.fetchAccountSnapshot(base, k)
                 }
             }.getOrNull()
@@ -1267,6 +1550,11 @@ class PlaylistRepository @Inject constructor(
             }
             Log.w(TAG_CAPS, "probe failed for ${playlistId.take(8)}; keeping last good snapshot")
             return false
+        }
+        // The default profile's users/me (another profile's key is ignored
+        // there): recorded, or the same-server check after an address change.
+        usedKey?.let { k ->
+            runCatching { profileManager.get().noteDefaultMe(playlist.id, base, k, snapshot.userId, snapshot.username) }
         }
         // SELF-HEAL: does the stored key actually authenticate as the account
         // whose username this playlist carries?
@@ -3903,6 +4191,9 @@ class PlaylistRepository @Inject constructor(
         // Display-only Dispatcharr account facts for the deleted row.
         runCatching { appPreferences.clearDispatcharrAccountFacts(playlistId) }
             .onFailure { Log.w("PlaylistRepo", "delete: account facts purge failed", it) }
+        // The default profile's recorded identity and any profile sign-in hold (A-APP-1).
+        runCatching { profileManager.get().forgetPlaylistHost(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "delete: profile host record purge failed", it) }
         // The VOD snapshot file is keyed by the playlist's IDENTITY, which is
         // derived from the row, so compute it BEFORE the row is gone.
         val row = dao.byId(playlistId)
