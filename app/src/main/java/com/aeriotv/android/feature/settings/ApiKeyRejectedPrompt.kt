@@ -111,9 +111,14 @@ fun ApiKeyRejectedPromptHost(
     // A Child never gets Edit Playlist (the Settings root hides it too).
     val activeRole by com.aeriotv.android.core.profiles.ProfileRoles.active.collectAsStateWithLifecycle()
     val p = prompt ?: return
+    // Never over the launch PIN gate or the launch picker: the prompt (and
+    // its Edit Playlist, Sign In, and Update from Phone) waits until it passes.
+    if (!LaunchPromptGate.promptShows(pending = true, gateUp = launchGate != null, pickerUp = launchPicker != null)) return
     val canSignIn = remember(p, launchGate, launchPicker, profileToken) { signInVm.canSignIn(p.playlistId) }
     val isChild = activeRole == com.aeriotv.android.core.profiles.ProfileRole.Child
-    val buttons = KeyRejectedCopy.buttons(isTv, canSignIn, isChild = isChild)
+    // The refused key is a non-default profile's own: only its own sign-in (APP7-1).
+    val profileKey = p.profileId != null
+    val buttons = KeyRejectedCopy.buttons(isTv, canSignIn, isChild = isChild, profileKey = profileKey)
     val focus = remember(p) { FocusRequester() }
     LaunchedEffect(p) { runCatching { focus.requestFocus() } }
     val act: (KeyRejectedCopy.Button) -> Unit = { b ->
@@ -135,7 +140,7 @@ fun ApiKeyRejectedPromptHost(
     SettingsAlertDialog(
         onDismissRequest = { DispatcharrRequestGate.consumePrompt() },
         title = { Text(KeyRejectedCopy.TITLE) },
-        text = { Text(KeyRejectedCopy.body(p.playlistName, p.passwordToo, p.noApiKey, isChild = isChild, canSignIn = canSignIn)) },
+        text = { Text(KeyRejectedCopy.body(p.playlistName, p.passwordToo, p.noApiKey, isChild = isChild, canSignIn = canSignIn, profileKey = profileKey)) },
         confirmButton = {
             // Emitted straight into the dialog's button row (no inner Row),
             // in order, so it wraps instead of clipping when they do not fit.

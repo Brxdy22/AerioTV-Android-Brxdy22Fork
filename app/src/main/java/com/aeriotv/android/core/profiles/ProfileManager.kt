@@ -1505,7 +1505,7 @@ class ProfileManager @Inject constructor(
         if (store.activeProfileId(p.playlistId) == profileId) {
             val def = store.forPlaylist(p.playlistId).first { it.isDefault }
             // The Admin removing the active profile: internal, no PIN prompt.
-            switchTo(p.playlistId, def.id, bypassPin = true).getOrThrow()
+            switchTo(p.playlistId, def.id, bypassPin = true, appMade = true).getOrThrow()
         }
         runCatching { favoriteDao.deleteScope(profileId) }
         runCatching { watchProgressDao.deleteScope(profileId) }
@@ -1557,9 +1557,36 @@ class ProfileManager @Inject constructor(
      * profile, 429 honored), re-reads permissions, swaps the scope, and asks
      * for a channel / group / VOD reload.
      */
-    suspend fun switchTo(playlistId: String, profileId: String, bypassPin: Boolean = false): Result<Unit> = runCatching {
+    suspend fun switchTo(
+        playlistId: String,
+        profileId: String,
+        bypassPin: Boolean = false,
+        /**
+         * The app switched on its own (a removal, a synced tombstone, a
+         * switch back after a failed fast switch), not the switcher or the
+         * launch picker: no sign-in form ever opens, and a target whose key
+         * is held is landed on with nothing sent (APP8-1, Apple parity).
+         */
+        appMade: Boolean = false,
+    ): Result<Unit> = runCatching {
         if (!bypassPin && pinStore.hasPin(profileId)) {
             check(switchTickets.remove(profileId)) { "Enter PIN" }
+        }
+        if (appMade) {
+            val target = store.byId(profileId) ?: error("Profile not found")
+            val def = store.forPlaylist(playlistId).firstOrNull { it.isDefault }
+            val to = def?.let { RejectedKeySwitch.appMadeTarget(target, it.id, unusable(target.id)) } ?: profileId
+            if (unusable(to)) {
+                // A Child whose sign-in cannot be used: no form and no switch.
+                Log.i(TAG, "[PROFILE] app-made switch on ${playlistId.take(8)} not run: the target's sign-in cannot be used")
+                return@runCatching
+            }
+            val row = playlistDao.rawById(playlistId)
+            val landHeld = store.byId(to)?.let {
+                RejectedKeySwitch.step(it, row?.apiKey, com.aeriotv.android.core.network.DispatcharrRequestGate::isKeyRejected, chosenByUser = false)
+            } == RejectedKeySwitch.Step.LandHeld
+            runSwitch(playlistId, to, landHeld)
+            return@runCatching
         }
         if (unusable(profileId)) {
             // Its sign-in is held after a server address change, or it has
@@ -1570,6 +1597,23 @@ class ProfileManager @Inject constructor(
             Log.i(TAG, "[PROFILE-HOST] sign-in form opened for a ${if (held) "held" else "signed-out"} profile on ${playlistId.take(8)}")
             throw ProfileSignInHeld()
         }
+        // Its key is held as rejected (2026-11-12, Roku spec 8.4 step 4): the
+        // sign-in form opens now, before sync or playback is touched, and
+        // nothing is sent with the held key. A pass continues this switch.
+        store.byId(profileId)?.let { target ->
+            val row = playlistDao.rawById(playlistId)
+            val form = RejectedKeySwitch.formFor(target, row?.apiKey, com.aeriotv.android.core.network.DispatcharrRequestGate::isKeyRejected)
+            if (form != RejectedKeySwitch.Form.None) {
+                _heldSignIn.value = HeldSignIn(playlistId, profileId, row?.name.orEmpty(), addressChanged = false, playlistOwn = form == RejectedKeySwitch.Form.PlaylistOwn)
+                Log.i(TAG, "[AUTH] sign-in form opened: the chosen profile's key is held as rejected on ${playlistId.take(8)}")
+                throw ProfileSignInHeld()
+            }
+        }
+        runSwitch(playlistId, profileId, landHeld = false)
+    }
+
+    /** The switch proper, after the PIN and any form: scrim, sign-in (none when [landHeld]), scope swap, reload. */
+    private suspend fun runSwitch(playlistId: String, profileId: String, landHeld: Boolean) {
         val gen = switchGen.incrementAndGet()
         watchdog?.cancel()
         watchdog = null
@@ -1580,14 +1624,14 @@ class ProfileManager @Inject constructor(
         ProfileSwitchFocus.onSwitchStarted()
         try {
             // Off the main thread: prefs commits and the row write are disk I/O.
-            kotlinx.coroutines.withContext(Dispatchers.IO) { switchToLocked(playlistId, profileId, gen) }
+            kotlinx.coroutines.withContext(Dispatchers.IO) { switchToLocked(playlistId, profileId, gen, landHeld) }
         } catch (t: Throwable) {
             if (gen == switchGen.get()) _switching.value = false
             throw t
         }
     }
 
-    private suspend fun switchToLocked(playlistId: String, profileId: String, gen: Long) {
+    private suspend fun switchToLocked(playlistId: String, profileId: String, gen: Long, landHeld: Boolean = false) {
         val target = store.byId(profileId) ?: error("Profile not found")
         val from = store.activeProfileId(playlistId)?.let(store::byId)
             ?: store.forPlaylist(playlistId).firstOrNull { it.isDefault }
@@ -1609,7 +1653,9 @@ class ProfileManager @Inject constructor(
         val warm = storedKey != null &&
             snapshotStamps.get(targetKey) != null &&
             runCatching { channelSnapshotDao.newestFetchedAtKey(targetKey) }.getOrNull() != null
-        if (warm) {
+        // An app-made switch to a target whose key is held: land on it like
+        // a warm switch, with no sign-in and nothing sent with the held key.
+        if (warm || landHeld) {
             mutex.withLock {
                 tLock = System.currentTimeMillis()
                 // A hold that landed since switchTo looked: never activate it.
@@ -1626,8 +1672,12 @@ class ProfileManager @Inject constructor(
                 timeshift.stopAllRetained("profile switch")
             }
             refreshActiveRole(playlistId)
-            Log.i(TAG, "[PROFILE] switch ${from?.displayName ?: "?"} -> ${target.displayName} (warm: cache first, sign-in behind)")
-            pendingProbe = PendingProbe(playlistId, gen, System.currentTimeMillis())
+            if (landHeld) {
+                Log.i(TAG, "[PROFILE] switch ${from?.displayName ?: "?"} -> ${target.displayName} (app-made; its key is held as rejected: no sign-in, nothing sent with it)")
+            } else {
+                Log.i(TAG, "[PROFILE] switch ${from?.displayName ?: "?"} -> ${target.displayName} (warm: cache first, sign-in behind)")
+                pendingProbe = PendingProbe(playlistId, gen, System.currentTimeMillis())
+            }
             Log.i(TAG, "[SWITCH] profile lock=${tLock - t0}ms gate=${System.currentTimeMillis() - t0}ms path=warm (auth and /me/ deferred)")
             watchdog = scope.launch {
                 kotlinx.coroutines.delay(SWITCH_TIMEOUT_MS)
@@ -1642,7 +1692,7 @@ class ProfileManager @Inject constructor(
             // competing with it for the network and the Room writer. Nothing
             // waits on the verification; it only sends a silent reload when
             // the permissions changed.
-            pendingVerify = PendingVerify(gen) { verifyWarmSwitch(playlistId, target, from, base, row, gen) }
+            if (!landHeld) pendingVerify = PendingVerify(gen) { verifyWarmSwitch(playlistId, target, from, base, row, gen) }
             reloads.send(Reload(playlistId, gen))
             return
         }
@@ -1767,7 +1817,7 @@ class ProfileManager @Inject constructor(
         } catch (e: DispatcharrError.InvalidCredentials) {
             Log.w(TAG, "[SWITCH] warm switch sign-in rejected for ${target.displayName}; returning to ${from?.displayName ?: "the previous profile"}")
             if (gen == switchGen.get() && from != null && from.id != target.id) {
-                switchTo(playlistId, from.id, bypassPin = true)
+                switchTo(playlistId, from.id, bypassPin = true, appMade = true)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "[SWITCH] warm switch verification failed (stored profile kept): ${t.message}")
@@ -1787,8 +1837,10 @@ class ProfileManager @Inject constructor(
         val playlistId: String,
         val profileId: String,
         val playlistName: String,
-        /** Held after a server address change; false = it has no stored sign-in (the plain form). */
+        /** Held after a server address change; false = it has no stored sign-in, or its key is held as rejected (the plain form). */
         val addressChanged: Boolean = true,
+        /** The default profile, whose key (the playlist's own) is held as rejected: the playlist's own sign-in form, then the switch goes on. */
+        val playlistOwn: Boolean = false,
     )
 
     private val _heldSignIn = kotlinx.coroutines.flow.MutableStateFlow<HeldSignIn?>(null)
@@ -2108,6 +2160,19 @@ class ProfileManager @Inject constructor(
         heldChanged()
     }
 
+    /**
+     * The playlist's own sign-in passed in the form a switch to the default
+     * profile opened (its key was held as rejected): the switch goes on. Only
+     * for the request that form was opened for (its PIN, if any, passed).
+     */
+    fun continueSwitchAfterOwnSignIn(playlistId: String, profileId: String) {
+        val req = _heldSignIn.value
+        if (req == null || !req.playlistOwn || req.playlistId != playlistId || req.profileId != profileId) return
+        _heldSignIn.value = null
+        ProfileSwitchFocus.arm(ProfileSwitchFocus.Target.Guide)
+        scope.launch { finishHeldSwitch(playlistId, profileId) }
+    }
+
     /** Cancel on the form: stay on the current profile. */
     fun closeHeldSignIn() {
         if (_heldSignIn.value != null) Log.i(TAG, "[PROFILE-HOST] sign-in form closed")
@@ -2124,7 +2189,7 @@ class ProfileManager @Inject constructor(
      */
     suspend fun signInHeldProfile(playlistId: String, profileId: String, username: String, password: String): Result<Unit> = runCatching {
         val req = _heldSignIn.value
-        check(req != null && req.playlistId == playlistId && req.profileId == profileId) { "Choose the profile again." }
+        check(req != null && !req.playlistOwn && req.playlistId == playlistId && req.profileId == profileId) { "Choose the profile again." }
         val p = store.byId(profileId)?.takeIf { it.playlistId == playlistId && !it.isDefault } ?: error("Profile not found")
         val row = playlistDao.rawById(playlistId) ?: error("Playlist not found")
         val base = repository.effectiveBaseUrl(row)
@@ -2135,6 +2200,7 @@ class ProfileManager @Inject constructor(
         if (!ProfileHostHold.isOwnUser(p.username, me.username)) throw DispatcharrError.InvalidCredentials("Signed in as another user.")
         store.update(profileId) { it.copy(password = password).applyMe(me, key) }
         ownSignInRepaired(playlistId, profileId)
+        DispatcharrLoginGate.reset(DispatcharrLoginGate.slotFor(playlistId, profileId))
         dropHold(profileId, "sign-in")
         // A Child that had no stored sign-in is no longer sealed.
         heldChanged()
