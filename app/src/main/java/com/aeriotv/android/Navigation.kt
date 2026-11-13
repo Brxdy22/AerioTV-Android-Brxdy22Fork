@@ -357,14 +357,23 @@ fun AerioTVNavHost(
     if (dlGraphEntry != null) {
         val dlVm: PlaylistViewModel = hiltViewModel(dlGraphEntry)
         val dlState by dlVm.state.collectAsStateWithLifecycle()
-        LaunchedEffect(deepLinkTarget, dlState.channels.size, dlCurrentEntry?.destination?.route) {
+        // A cold-start channel link waits for the launch to leave its start
+        // screen (BOOTSTRAP's ChannelsReady step navigates to MAIN, popping a
+        // player opened under it) and for any launch PIN, picker, or profile
+        // switch; then it follows the warm-start rules below.
+        val dlChannelLinkHeld = dlCurrentEntry?.destination?.route == Routes.BOOTSTRAP ||
+            dlLaunchGate != null || dlLaunchPicker != null || dlSwitching
+        LaunchedEffect(deepLinkTarget, dlState.channels.size, dlCurrentEntry?.destination?.route, dlChannelLinkHeld) {
             val target = deepLinkTarget ?: return@LaunchedEffect
             when (target) {
                 is DeepLinkTarget.Channel -> {
-                    val exists = dlState.channels.any {
-                        it.id == target.channelId && it.url.isNotBlank()
-                    }
-                    if (exists) {
+                    if (dlChannelLinkHeld) return@LaunchedEffect
+                    // aeriotv://channel/<id> in any documented form (README,
+                    // Deep links): resolved to the active playlist's channel.
+                    val resolved = ChannelDeepLink.resolve(target.channelId, dlState.channels)
+                        ?.takeIf { it.url.isNotBlank() }
+                    if (resolved != null) {
+                        val channelId = resolved.id
                         // If this TV is already on the LIVE player, re-tune in
                         // place (PlayerScreen observes castChannelRequest); a
                         // catch-up replay shares the player/ route but its prime
@@ -380,13 +389,15 @@ fun AerioTVNavHost(
                             // While controlling a TV the player IS the remote
                             // screen; a notification tap just brings it forward.
                             // requestCastChannel would start LOCAL playback.
-                            if (!controllingTv) dlCastReceiver.requestCastChannel(target.channelId)
+                            if (!controllingTv) dlCastReceiver.requestCastChannel(channelId)
                         } else {
-                            navController.navigate(Routes.player(target.channelId))
+                            navController.navigate(Routes.player(channelId))
                         }
                         onDeepLinkConsumed()
                     } else if (dlState.phase == PlaylistViewModel.Phase.ChannelsReady) {
-                        onDeepLinkConsumed() // channels loaded, id gone => drop
+                        // Channels loaded and nothing matches: drop it quietly.
+                        android.util.Log.i("AerioDeepLink", "[DEEPLINK] channel link matched no channel: ${target.channelId}")
+                        onDeepLinkConsumed()
                     }
                 }
                 is DeepLinkTarget.Vod -> {
@@ -603,7 +614,9 @@ fun AerioTVNavHost(
                                 .appPreferences()
                             val resume = prefs.autoResumeLastChannelOnce()
                             val resumeId = if (resume) prefs.lastWatchedChannelIdOnce() else ""
-                            val hasResumeTarget = resumeId.isNotBlank() &&
+                            // A channel link opened the app: it plays instead.
+                            val hasResumeTarget = deepLinkTarget !is DeepLinkTarget.Channel &&
+                                resumeId.isNotBlank() &&
                                 state.channels.any { it.id == resumeId && it.url.isNotBlank() }
                             if (hasResumeTarget) {
                                 navController.navigate(Routes.MAIN) {
@@ -616,6 +629,16 @@ fun AerioTVNavHost(
                                 }
                             }
                         }
+                    }
+                }
+
+                // A held key with nothing cached: the main screen with its error
+                // state, where the rejected-key prompt shows once the launch
+                // gate passes. Never the add-playlist screen (Apple parity).
+                val keyHeldLaunch = state.launchError != null
+                LaunchedEffect(keyHeldLaunch) {
+                    if (keyHeldLaunch) navController.navigate(Routes.MAIN) {
+                        popUpTo(Routes.PLAYLIST_GRAPH) { inclusive = false }
                     }
                 }
 

@@ -33,6 +33,33 @@ import com.aeriotv.android.ui.settings.dpadFocusRing
 import kotlinx.coroutines.launch
 
 /**
+ * The form's Add button, run from the dialog's own button row instead (Add
+ * Profile on TV, matching Apple: Cancel and Add Profile sit together below
+ * the scrolling form, so they are always on screen). With one passed in, the
+ * form draws no button of its own; [submit] does what that button did.
+ */
+@androidx.compose.runtime.Stable
+class ManualProfileSubmit {
+    internal val busyState = mutableStateOf(false)
+    internal val readyState = mutableStateOf(false)
+    internal var action: () -> Unit = {}
+
+    /** A sign-in is running. */
+    val busy: Boolean get() = busyState.value
+
+    /** The fields hold what a sign-in needs (see [ManualProfileFormRules.ready]). */
+    val ready: Boolean get() = readyState.value
+
+    fun submit() = action()
+}
+
+object ManualProfileFormRules {
+    /** Username and password both filled in, or a key. */
+    fun ready(isPassword: Boolean, username: String, secret: String): Boolean =
+        secret.isNotBlank() && (!isPassword || username.isNotBlank())
+}
+
+/**
  * Manual Add Profile (the base login is not a Dispatcharr admin, so the
  * users list is not readable). The connect form's toggle comes first:
  * Username & Password shows Username and Password; API Key shows only the
@@ -44,8 +71,15 @@ import kotlinx.coroutines.launch
 fun ManualProfileForm(
     onAdd: suspend (username: String, password: String?, apiKey: String?) -> String?,
     modifier: Modifier = Modifier,
-    /** Scan / Photos / Import file buttons above the fields (Settings); onboarding has its own card. */
+    /**
+     * Add Profile in Settings (Apple f4cf2e9): in API Key mode, a "Scan QR
+     * code" capsule and the Photos and Import file links under the key
+     * field (phones and tablets). A code fills the key and does not submit.
+     * Onboarding has its own card.
+     */
     showQr: Boolean = true,
+    /** The playlist's server and local URLs: a scanned user code must be for this server (by host). */
+    qrServerUrls: List<String?> = emptyList(),
     /** Onboarding: a small "Use an API key instead" link in place of the segmented control. */
     modeAsLink: Boolean = false,
     /** Drawn between the fields and the Add button (onboarding Role choice). */
@@ -53,44 +87,23 @@ fun ManualProfileForm(
     submitLabel: String = "Add Profile",
     /** Focus target for the first field (TV hand-off when the form opens). */
     firstFieldModifier: Modifier = Modifier,
+    /** The gap between the form's parts (Add Profile on TV passes a tighter one). */
+    spacing: androidx.compose.ui.unit.Dp = 8.dp,
+    /** The dialog's button row runs the Add instead of a button in the form (Add Profile on TV). */
+    submit: ManualProfileSubmit? = null,
 ) {
     var username by remember { mutableStateOf("") }
     var mode by remember { mutableStateOf(DispatcharrAuthMode.UsernamePassword) }
     var secret by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
+    val ownBusy = remember { mutableStateOf(false) }
+    var busy by (submit?.busyState ?: ownBusy)
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val isPassword = mode == DispatcharrAuthMode.UsernamePassword
-    var scannedUser by remember { mutableStateOf<String?>(null) }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        val selectMode: (DispatcharrAuthMode) -> Unit = { mode = it; username = ""; secret = ""; error = null; scannedUser = null }
-        if (!modeAsLink) SegmentedAuthControl(selected = mode, onSelect = selectMode, enabled = !busy)
-        // Dispatcharr user QR (phones and tablets): the key signs in the same
-        // way as a pasted key. The username in the code is display only.
-        if (showQr) com.aeriotv.android.feature.qrscan.QrScanActions(
-            enabled = !busy,
-            onResult = { r ->
-                when (r) {
-                    is com.aeriotv.android.core.qr.ScannedCode.Result.UserKey -> {
-                        mode = DispatcharrAuthMode.ApiKey; username = ""; secret = r.apiKey
-                        scannedUser = r.username; error = null
-                        if (!busy) {
-                            busy = true
-                            scope.launch {
-                                error = onAdd("", null, r.apiKey)
-                                busy = false
-                                if (error == null) { secret = ""; scannedUser = null }
-                            }
-                        }
-                    }
-                    is com.aeriotv.android.core.qr.ScannedCode.Result.SetupLink ->
-                        com.aeriotv.android.feature.qrscan.openSetupLink(context, r.link)
-                    com.aeriotv.android.core.qr.ScannedCode.Result.Invalid -> Unit
-                }
-            },
-        )
-        scannedUser?.let { Text("Signed in as $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(spacing)) {
+        val selectMode: (DispatcharrAuthMode) -> Unit = { mode = it; username = ""; secret = ""; error = null }
+        // Two capsules sized to their labels, so "Username & Password" stays on one line (Apple parity).
+        if (!modeAsLink) SegmentedAuthControl(selected = mode, onSelect = selectMode, enabled = !busy, capsules = true)
         if (!modeAsLink) Text(
             if (isPassword) "Sign in as that Dispatcharr user once." else "The API key identifies the Dispatcharr user.",
             style = MaterialTheme.typography.bodySmall,
@@ -133,6 +146,19 @@ fun ManualProfileForm(
                 )
             }
             }
+            // The user's Dispatcharr QR (Users page, "Scan API Key"): fills the
+            // key above; Add Profile still adds it. Phones and tablets only.
+            if (showQr) com.aeriotv.android.feature.qrscan.QrScanActions(
+                enabled = !busy,
+                linksOnly = true,
+                scanCapsule = true,
+                showUserQr = false,
+                prompt = com.aeriotv.android.core.qr.ScannedCode.ADD_PROFILE_PROMPT,
+                accept = { com.aeriotv.android.core.qr.ScannedCode.addProfileProblem(it, qrServerUrls) },
+                onResult = { r ->
+                    if (r is com.aeriotv.android.core.qr.ScannedCode.Result.UserKey) { secret = r.apiKey; error = null }
+                },
+            )
         }
         if (modeAsLink) {
             androidx.compose.material3.TextButton(
@@ -143,21 +169,30 @@ fun ManualProfileForm(
         }
         beforeSubmit()
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-        // Never disabled mid-flow (TV focus); taps are ignored while busy.
-        Button(
-            onClick = {
-                if (busy || secret.isBlank() || (isPassword && username.isBlank())) return@Button
-                busy = true; error = null
-                scope.launch {
-                    error = if (isPassword) onAdd(username.trim(), secret, null) else onAdd("", null, secret.trim())
-                    busy = false
-                    if (error == null) { username = ""; secret = "" }
-                }
-            },
-            modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp).dpadFocusRing(RoundedCornerShape(50), onFilled = true),
-        ) {
-            if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
-            else Text(submitLabel)
+        val submitNow: () -> Unit = submitNow@{
+            if (busy || !ManualProfileFormRules.ready(isPassword, username, secret)) return@submitNow
+            busy = true; error = null
+            scope.launch {
+                error = if (isPassword) onAdd(username.trim(), secret, null) else onAdd("", null, secret.trim())
+                busy = false
+                if (error == null) { username = ""; secret = "" }
+            }
+        }
+        if (submit != null) {
+            val ready = ManualProfileFormRules.ready(isPassword, username, secret)
+            androidx.compose.runtime.SideEffect {
+                submit.action = submitNow
+                submit.readyState.value = ready
+            }
+        } else {
+            // Never disabled mid-flow (TV focus); taps are ignored while busy.
+            Button(
+                onClick = submitNow,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp).dpadFocusRing(RoundedCornerShape(50), onFilled = true),
+            ) {
+                if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = MaterialTheme.colorScheme.onPrimary, strokeWidth = 2.dp)
+                else Text(submitLabel)
+            }
         }
     }
 }

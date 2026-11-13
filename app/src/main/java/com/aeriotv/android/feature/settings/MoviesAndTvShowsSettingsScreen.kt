@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -74,15 +75,17 @@ fun MoviesAndTvShowsSettingsScreen(
             SettingsDetailTopBar(title = "Movies & TV Shows", onBack = onBack)
 
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+                val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
                 LazyColumn(
-                    modifier = Modifier.settingsFormWidth(),
+                    state = paneList,
+                    modifier = Modifier.settingsFormWidth().settingsPaneTopEdge(paneList),
                     contentPadding = PaddingValues(
                         start = 16.dp,
                         end = 16.dp,
                         top = 12.dp,
                         bottom = LocalTabBarBottomInset.current,
                     ),
-                    verticalArrangement = Arrangement.spacedBy(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
                 ) {
                     // MARK: Refresh library
                     //
@@ -207,7 +210,7 @@ fun MoviesAndTvShowsSettingsScreen(
                             // Apple iOS: short attribution inside the footer, always.
                             // Apple tvOS: long attribution below, always.
                             TmdbAttribution(
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 8.dp),
                                 long = isTv,
                                 isTv = isTv,
                                 caption = isTv,
@@ -272,7 +275,7 @@ private fun ScaleAToASliderRow(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {

@@ -113,11 +113,19 @@ class DispatcharrKeyRecheck @Inject constructor(
             // key, so the key itself is probed instead (2026-11-12, security).
             val row = if (r.passwordToo) dao.byId(r.playlistId) else null
             if (row != null && row.apiKey?.trim() == r.key.trim()) {
-                val fresh = broker.silentRebootstrapApiKey(row)
-                accepted = fresh != null
+                val fresh = broker.silentRebootstrapApiKey(row, refusedKey = r.key)?.trim()?.takeIf { it.isNotEmpty() }
+                // The re-login's key was checked before it came back (one
+                // request); a key the server refused comes back as none and
+                // the hold stays. The held key itself coming back proves
+                // nothing (2026-11-12, Apple 44c544c: it lifted the hold and
+                // restarted the loop).
+                accepted = fresh != null && fresh != r.key.trim()
+                val slot = broker.loginSlot(row)
                 outcome = when {
                     accepted -> "accepted (re-login issued a key)"
-                    DispatcharrLoginGate.isRejected(broker.loginSlot(row)) -> "rejected (login refused)"
+                    DispatcharrLoginGate.isRejected(slot) -> "rejected (login refused)"
+                    DispatcharrLoginGate.accountHasNoKey(slot) -> "rejected (the account has no API key)"
+                    DispatcharrLoginGate.foundRefusedKey(slot) -> "rejected (the key the re-login issued was refused)"
                     else -> "unknown"
                 }
             } else {

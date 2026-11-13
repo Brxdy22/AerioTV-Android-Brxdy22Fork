@@ -73,6 +73,7 @@ class PlaylistViewModel @Inject constructor(
     private val exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
     private val exoWindowState: com.aeriotv.android.feature.player.ExoWindowState,
     private val miniPlayerSession: com.aeriotv.android.feature.miniplayer.MiniPlayerSession,
+    private val castSender: com.aeriotv.android.core.cast.AerioCastSender,
     // Launch ordering only: the guide announces its cached paint here so the
     // other sections' CACHED restores can start right behind it instead of
     // waiting out the 20 s settle delay (see AppSettleGate.awaitGuidePainted).
@@ -158,6 +159,13 @@ class PlaylistViewModel @Inject constructor(
         val isLoading: Boolean = false,
         /** Launch with no cached channels while the active Child is held ([HeldListCopy]): the line Setting Up shows as it stays. */
         val bootstrapLine: String? = null,
+        /**
+         * Launch with no cached channels while the sign-in's key is held
+         * ([HeldListCopy.LaunchFailed.MainWithError]): the reason the main
+         * screen's error state shows. Set, the launch goes to the main screen,
+         * never the add-playlist screen; cleared when channels land.
+         */
+        val launchError: String? = null,
         /** Add Playlist while a 429 counts down: "The server is busy. Trying again in N seconds." */
         val busyMessage: String? = null,
         val error: String? = null,
@@ -545,6 +553,20 @@ class PlaylistViewModel @Inject constructor(
         }
         viewModelScope.launch {
             profileManager.manageRequests.collect { requestSettingsPage("playlist-detail") }
+        }
+        // Every change of the active profile lands Live TV on the new
+        // profile's own group (its Default Group, else All), the same rule a
+        // switch follows. A switch, a playlist activation, and the launch land
+        // on their own path; any other change (a server address hold moving
+        // the profile to the default one) lands here (Nothing Phone
+        // 2026-11-13: the guide stayed on the held profile's Favorites).
+        viewModelScope.launch {
+            com.aeriotv.android.core.profiles.ProfileScope.changes.collect { change ->
+                if (!com.aeriotv.android.core.profiles.ProfileLanding.needsLanding(change.reason)) return@collect
+                val playlist = _state.value.playlist ?: return@collect
+                val group = landingGroupFor(playlist.id, groupNamesOf(_state.value.channels), change.reason)
+                _state.update { it.copy(selectedGroup = group) }
+            }
         }
         // A completed switch to another profile lands on the Live TV tab.
         viewModelScope.launch {
@@ -940,6 +962,7 @@ class PlaylistViewModel @Inject constructor(
                     _state.update {
                         it.copy(
                             phase = Phase.ChannelsReady,
+                            launchError = null,
                             channels = if (kept) it.channels else channels,
                             isLoading = false,
                             error = null,
@@ -965,24 +988,45 @@ class PlaylistViewModel @Inject constructor(
                         // unreachable right now.
                         Log.w(TAG, "channel refresh failed; cached rail still visible", t)
                         _state.update { it.copy(isLoading = false) }
-                    } else if (!HeldListCopy.launchGoesToAdd(heldHere(saved))) {
-                        // A held Child (its playlist moved, no same-server check
-                        // yet) stays here with the line, never the add-playlist screen.
-                        Log.w(TAG, "[PROFILE-HOST] channel refresh refused: the active profile is held at this address; staying")
-                        _state.update { it.copy(isLoading = false, error = HeldListCopy.LINE, bootstrapLine = HeldListCopy.LINE) }
-                    } else {
-                        _state.update {
-                            it.copy(
-                                phase = Phase.NeedsUrl,
-                                isLoading = false,
-                                error = "Failed to refresh saved source: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
-                            )
+                    } else when (HeldListCopy.launchFailed(heldHere(saved), keyHeldAtLaunch(saved.id, t))) {
+                        HeldListCopy.LaunchFailed.StayWithLine -> {
+                            // A held Child (its playlist moved, no same-server check
+                            // yet) stays here with the line, never the add-playlist screen.
+                            Log.w(TAG, "[PROFILE-HOST] channel refresh refused: the active profile is held at this address; staying")
+                            _state.update { it.copy(isLoading = false, error = HeldListCopy.LINE, bootstrapLine = HeldListCopy.LINE) }
+                        }
+                        HeldListCopy.LaunchFailed.MainWithError -> {
+                            // The key is held: the main screen with its error state;
+                            // the rejected-key prompt shows there once the launch
+                            // gate passes, and its Sign In, Fix Login, or Edit
+                            // Playlist reloads the channels (Apple parity).
+                            val reason = LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")
+                            Log.w(TAG, "[AUTH] channel refresh refused: the key is held, no cached channels; main screen with the error state")
+                            _state.update { it.copy(isLoading = false, error = reason, launchError = reason) }
+                        }
+                        HeldListCopy.LaunchFailed.AddPlaylist -> {
+                            _state.update {
+                                it.copy(
+                                    phase = Phase.NeedsUrl,
+                                    isLoading = false,
+                                    error = "Failed to refresh saved source: ${LogSanitizer.redact(t.message ?: t::class.simpleName ?: "unknown error")}",
+                                )
+                            }
                         }
                     }
                 },
             )
         }
     }
+
+    /**
+     * The gate holds [playlistId]'s key (its own sign-in or a profile's), or
+     * [t] is the gate's held-key refusal. Only a held key: its calls stay on
+     * the device, so the main screen's background work sends nothing with it.
+     */
+    private fun keyHeldAtLaunch(playlistId: String, t: Throwable): Boolean =
+        com.aeriotv.android.core.network.DispatcharrRequestGate.isPlaylistRejected(playlistId) ||
+            generateSequence(t) { it.cause }.take(8).any { it is com.aeriotv.android.core.network.DispatcharrError.KeyRejected }
 
     fun onSourceTypeChange(value: SourceType) {
         _state.update { it.copy(sourceType = value, error = null) }
@@ -1098,11 +1142,18 @@ class PlaylistViewModel @Inject constructor(
         playlistId: String,
         knownGroups: Collection<String>,
         landing: Landing,
+    ): String = landingGroupFor(playlistId, knownGroups, landing.label)
+
+    /** [landingGroupFor] for any [reason]; every landing logs "[PROFILE] landing group=... reason=...". */
+    private suspend fun landingGroupFor(
+        playlistId: String,
+        knownGroups: Collection<String>,
+        reason: String,
     ): String {
         val preferred = appPreferences.defaultGroupTokenOnce(playlistId)
         val group = com.aeriotv.android.feature.livetv.landingGroupToken(preferred, knownGroups)
             ?: ALL_GROUPS
-        Log.i(TAG, "[PROFILE] ${landing.label} landing group=$group (default=${if (preferred.isBlank()) "unset" else "set"})")
+        Log.i(TAG, "[PROFILE] landing group=$group reason=$reason (default=${if (preferred.isBlank()) "unset" else "set"})")
         return group
     }
 
@@ -1218,6 +1269,7 @@ class PlaylistViewModel @Inject constructor(
                     _state.update {
                         it.copy(
                             phase = Phase.ChannelsReady,
+                            launchError = null,
                             playlist = entity,
                             // Remember THIS draft's row so a re-test edits it
                             // instead of duplicating; never the active playlist.
@@ -1284,6 +1336,7 @@ class PlaylistViewModel @Inject constructor(
                 _state.update {
                     it.copy(
                         phase = Phase.ChannelsReady,
+                        launchError = null,
                         playlist = entity,
                         draftPlaylistId = entity.id,
                         channels = channels,
@@ -1313,7 +1366,10 @@ class PlaylistViewModel @Inject constructor(
      * guidance (Discord report, Onn 4K, 2026-07-29).
      */
     private fun loadFailureMessage(prefix: String, t: Throwable): String =
-        if (t is RateLimitRetry.RateLimitedFinal) {
+        if (t is com.aeriotv.android.core.profiles.StoredSecrets.Refused) {
+            // Shown as it is: it says what to type (StoredSecrets).
+            t.message.orEmpty()
+        } else if (t is RateLimitRetry.RateLimitedFinal) {
             t.message ?: rateLimitedMessage(t.seconds, t.reason)
         } else if (t.rateLimitSeconds() != null) {
             // A 429 names the rate limit, never "Could not connect: HTTP 429".
@@ -1354,7 +1410,9 @@ class PlaylistViewModel @Inject constructor(
         epgLoadPlaylistId = playlist.id
         epgLoadForced = force
         epgLoadColdLaunch = cold
-        epgLoadJob = viewModelScope.launch {
+        // The playlist instance it started under: after a delete and re-add
+        // with the same id, this load's late writes are dropped (DeletedPlaylists).
+        epgLoadJob = viewModelScope.launch(com.aeriotv.android.core.data.repository.DeletedPlaylists.started(playlist.id)) {
             prior?.join()
             coroutineContext[kotlinx.coroutines.Job]?.let { trackPlaylistTask(playlist.id, "EPG load", it) }
             try {
@@ -2405,7 +2463,13 @@ class PlaylistViewModel @Inject constructor(
                     // Last Connected values go live (the repo just stamped them).
                     val updated = repository.activePlaylist()
                     _state.update {
+                        // A launch still on Setting Up finishes here (a recovery's refresh).
+                        val next = HeldListCopy.phaseAfterChannelsLanded(it.phase, channels.isNotEmpty())
                         it.copy(
+                            phase = next,
+                            bootstrapLine = if (next != it.phase) null else it.bootstrapLine,
+                            // The refresh got through: the key-held error state is over.
+                            launchError = null,
                             channels = channels,
                             isLoading = false,
                             playlist = updated ?: it.playlist,
@@ -2688,6 +2752,10 @@ class PlaylistViewModel @Inject constructor(
          * stays non-active and never touches the active session state.
          */
         playlistId: String? = null,
+        /** [password] is the saved one the form showed, untouched (StoredSecrets: it goes only to a proven address). */
+        storedPassword: Boolean = false,
+        /** [apiKey] is the saved key the form showed, untouched. */
+        storedApiKey: Boolean = false,
     ) {
         viewModelScope.launch {
             // Fresh save, fresh plan: the previous save's rows must not decide
@@ -2723,6 +2791,8 @@ class PlaylistViewModel @Inject constructor(
                 vodEnabled = vodEnabled,
                 epgRetentionDays = sanitizeGuideDays(epgRetentionDays),
                 customUserAgent = customUserAgent,
+                storedPassword = storedPassword,
+                storedApiKey = storedApiKey,
             )
             // Item 13 (Apple parity): the form edits the playlist's OWN sign-in.
             // With a non-default profile active on this playlist (not held, and
@@ -3205,6 +3275,7 @@ class PlaylistViewModel @Inject constructor(
                 val applyCached: (UiState) -> UiState = {
                     it.copy(
                         phase = Phase.ChannelsReady,
+                        launchError = null,
                         playlist = row,
                         channels = cached,
                         selectedGroup = launchGroup,
@@ -3244,6 +3315,7 @@ class PlaylistViewModel @Inject constructor(
                     val applyFetched: (UiState) -> UiState = {
                         it.copy(
                             phase = Phase.ChannelsReady,
+                            launchError = null,
                             playlist = entity,
                             channels = channels,
                             selectedGroup = launchGroup,
@@ -3306,12 +3378,19 @@ class PlaylistViewModel @Inject constructor(
             return
         }
         val kept = sameChannelsForGuide(_state.value.channels, channels)
+        // A launch still on Setting Up (a held profile whose hold has now
+        // lifted) finishes with these channels instead of staying up.
+        val finish: (UiState) -> UiState = {
+            val next = HeldListCopy.phaseAfterChannelsLanded(it.phase, hasChannels = true)
+            if (next != it.phase) Log.i(TAG, "[STARTUP] launch finished by $reason (${channels.size} channels)")
+            it.copy(phase = next, bootstrapLine = if (next != it.phase) null else it.bootstrapLine, launchError = null)
+        }
         if (kept) {
-            _state.update { it.copy(playlist = entity, isLoading = false, error = null) }
+            _state.update { finish(it.copy(playlist = entity, isLoading = false, error = null)) }
             Log.i(TAG, "[REFRESH] $reason landed (${channels.size} channels, unchanged; guide kept)")
             return
         }
-        val apply: (UiState) -> UiState = { it.copy(playlist = entity, channels = channels, isLoading = false, error = null) }
+        val apply: (UiState) -> UiState = { finish(it.copy(playlist = entity, channels = channels, isLoading = false, error = null)) }
         rebuildGuideCatalog(entity, "channels-changed", channelsOverride = channels, alsoApply = apply)
         Log.i(TAG, "[REFRESH] $reason landed (${channels.size} channels, changed; one guide install)")
         loadEpgIfConfigured(entity, keepCatalog = true)
@@ -3417,6 +3496,7 @@ class PlaylistViewModel @Inject constructor(
         val applySwitch: (UiState) -> UiState = {
             it.copy(
                 phase = Phase.ChannelsReady,
+                launchError = null,
                 playlist = entity,
                 channels = cached,
                 selectedGroup = launchGroup,
@@ -3497,9 +3577,20 @@ class PlaylistViewModel @Inject constructor(
         }
     }
 
+    /**
+     * The delete prompt's count: on-device recordings that came from
+     * [playlistId] (local captures and Save to Device copies), plus one being
+     * recorded from it now. Zero keeps the plain confirmation.
+     */
+    suspend fun onDeviceRecordingCount(playlistId: String): Int =
+        repository.onDeviceRecordingCount(playlistId) +
+            if (com.aeriotv.android.feature.dvr.LocalRecordingService.isRecordingFor(playlistId)) 1 else 0
+
     /** Delete a saved playlist by id. If the deleted row was the active one,
-     * fall back to the most-recent remaining playlist (or NeedsUrl if none). */
-    fun deletePlaylist(playlistId: String) {
+     * fall back to the most-recent remaining playlist (or NeedsUrl if none).
+     * [keepRecordings]: its on-device recordings stay as "Saved on this
+     * device"; false deletes them. Nothing is sent to the server. */
+    fun deletePlaylist(playlistId: String, keepRecordings: Boolean = true) {
         // Crash guard (Apple d051505 parity): stop every task that holds this
         // playlist BEFORE the row is deleted; none of them may read or write
         // the deleted record afterward.
@@ -3507,7 +3598,15 @@ class PlaylistViewModel @Inject constructor(
         cancelPlaylistTasks(playlistId)
         viewModelScope.launch {
             val wasActive = repository.activePlaylist()?.id == playlistId
-            repository.deletePlaylist(playlistId)
+            // An on-device recording from it stops now, keeping what it
+            // captured unless its recordings go with it.
+            if (com.aeriotv.android.feature.dvr.LocalRecordingService.playlistDeleted(appContext, playlistId, keepRecordings)) {
+                Log.i(TAG, "[PLAYLIST] delete ${playlistId.take(8)}: its on-device recording stopped")
+            }
+            // Nothing from it plays on: the player, the mini player or PiP,
+            // Multiview, and a Cast session (playback is the active playlist's).
+            if (wasActive) stopPlaybackForDelete(playlistId)
+            repository.deletePlaylist(playlistId, keepRecordings)
             if (wasActive) {
                 val remaining = repository.allOnce()
                 val next = remaining.firstOrNull()
@@ -3520,6 +3619,16 @@ class PlaylistViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    private fun stopPlaybackForDelete(playlistId: String) {
+        runCatching { miniPlayerSession.dismiss() }
+        runCatching { exoWindowState.hide() }
+        runCatching { exoHolder.stop() }
+        runCatching { com.aeriotv.android.feature.multiview.MultiviewTilePlayers.stopAll("playlist deleted") }
+        runCatching { if (castSender.content.value != null) castSender.stopPlayback() }
+        runCatching { profileManager.requestClosePlayer() }
+        Log.i(TAG, "[PLAYLIST] delete ${playlistId.take(8)}: playback from it stopped")
     }
 
     fun clearPlaylist() {

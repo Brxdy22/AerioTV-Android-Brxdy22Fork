@@ -91,7 +91,8 @@ class UserQrViewModel @Inject constructor(
     private val dispatcharrClient: com.aeriotv.android.core.network.DispatcharrClient,
     private val repository: com.aeriotv.android.core.data.repository.PlaylistRepository,
 ) : ViewModel() {
-    data class Target(val playlistId: String, val profileId: String, val username: String)
+    /** [displayName]: the profile's name as the profile list shows it (the PIN pad names it). */
+    data class Target(val playlistId: String, val profileId: String, val username: String, val displayName: String)
 
     /** The active playlist's active profile, when it has an API key saved here. */
     suspend fun activeTarget(): Target? {
@@ -103,7 +104,7 @@ class UserQrViewModel @Inject constructor(
     suspend fun target(playlistId: String, profileId: String): Target? {
         manager.userQrText(playlistId, profileId) ?: return null
         val p = manager.profiles(playlistId).first().firstOrNull { it.id == profileId } ?: return null
-        return Target(playlistId, profileId, p.username)
+        return Target(playlistId, profileId, p.username, p.displayName)
     }
 
     suspend fun text(t: Target): String? = manager.userQrText(t.playlistId, t.profileId)
@@ -113,8 +114,8 @@ class UserQrViewModel @Inject constructor(
 
     /**
      * While the code is on screen, a scanner on this network may ask for this
-     * device's whole setup (docs/DeviceSetupHandoff.md). Sends the same full
-     * payload as the banner flow's "Copy entire setup from this device".
+     * device's playlist and profiles (docs/DeviceSetupHandoff.md). Sends the
+     * same full payload as the banner flow's "Copy this playlist and its profiles".
      */
     fun source(t: Target, text: String): com.aeriotv.android.core.setup.UserQrSource? {
         val key = com.aeriotv.android.core.qr.ScannedCode.parseUserKey(text)?.apiKey ?: return null
@@ -188,7 +189,7 @@ private fun UserQrFlow(t: UserQrViewModel.Target, vm: UserQrViewModel, onClose: 
     var unlocked by remember(t) { mutableStateOf(!vm.needsPin(t)) }
     if (!unlocked) {
         PinEntryDialog(
-            title = "Enter the PIN to show this code",
+            title = com.aeriotv.android.core.profiles.PinCopy.userQr(t.displayName),
             type = vm.pinType(t) ?: PinType.Numbers,
             onDismiss = onClose,
             onEntered = { seq ->
@@ -201,7 +202,8 @@ private fun UserQrFlow(t: UserQrViewModel.Target, vm: UserQrViewModel, onClose: 
     val text by produceState<String?>(null, t) { value = vm.text(t) }
     Dialog(
         onDismissRequest = onClose,
-        properties = DialogProperties(usePlatformDefaultWidth = false, securePolicy = SecureFlagPolicy.SecureOn),
+        // Its own buttons close it; a tap outside never does.
+        properties = DialogProperties(usePlatformDefaultWidth = false, securePolicy = SecureFlagPolicy.SecureOn, dismissOnClickOutside = false),
     ) {
         val src = remember(text) { text?.let { vm.source(t, it) } }
         DisposableEffect(src) {

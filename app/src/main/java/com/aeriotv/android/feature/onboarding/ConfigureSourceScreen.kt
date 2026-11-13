@@ -166,7 +166,7 @@ fun ConfigureSourceScreen(
     }
 
     // User QR from a device on this network (docs/DeviceSetupHandoff.md): look
-    // for the device showing it for 3 s; found = offer to copy its whole setup.
+    // for the device showing it for 3 s; found = offer to copy its playlist and profiles.
     val userQrContext = androidx.compose.ui.platform.LocalContext.current
     val userQrScope = androidx.compose.runtime.rememberCoroutineScope()
     var userQrProbing by remember { mutableStateOf(false) }
@@ -231,7 +231,7 @@ fun ConfigureSourceScreen(
                         color = MaterialTheme.colorScheme.onBackground,
                     )
                     Text(
-                        "Copy every playlist and profile from ${found.name}, or add just the user in this code.",
+                        com.aeriotv.android.feature.devicesetup.SetupChoiceCopy.userQrOffer(found.name),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -240,7 +240,7 @@ fun ConfigureSourceScreen(
                             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
                             .selectableGroup(),
                     ) {
-                        listOf(false to "Copy entire setup from this device", true to "Import this user only").forEach { (value, label) ->
+                        listOf(false to com.aeriotv.android.feature.devicesetup.SetupChoiceCopy.PLAYLIST_AND_PROFILES, true to com.aeriotv.android.feature.devicesetup.SetupChoiceCopy.USER_ONLY).forEach { (value, label) ->
                             androidx.compose.foundation.layout.Row(
                                 Modifier.fillMaxWidth()
                                     .selectable(selected = userOnly == value, onClick = { userOnly = value }, role = androidx.compose.ui.semantics.Role.RadioButton)
@@ -880,6 +880,10 @@ internal fun IconTextField(
     trailingFocused: () -> Boolean = { false },
     keyboardOptions: androidx.compose.foundation.text.KeyboardOptions = aerioTextFieldKeyboardOptions(),
 ) {
+    if (com.aeriotv.android.feature.settings.LocalTvCompactForm.current) {
+        CompactIconTextField(value, onValueChange, placeholder, leading, enabled, visualTransformation, trailing, trailingFocused, keyboardOptions)
+        return
+    }
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
@@ -889,7 +893,8 @@ internal fun IconTextField(
                 okSuppressed = trailingFocused,
             ),
         singleLine = true,
-        placeholder = { Text(placeholder, style = androidx.compose.material3.LocalTextStyle.current.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant) },
+        // One line like the field itself: a long hint ends in an ellipsis instead of growing the field.
+        placeholder = { Text(placeholder, style = androidx.compose.material3.LocalTextStyle.current.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) },
         leadingIcon = {
             Icon(
                 imageVector = leading,
@@ -905,6 +910,77 @@ internal fun IconTextField(
     )
 }
 
+
+/**
+ * [IconTextField] inside Add Profile's form on TV: the same outlined field
+ * (icon, placeholder, reveal eye, TV focus handling) at
+ * [com.aeriotv.android.feature.settings.ProfileDialogRules.TvForm.FIELD_HEIGHT_DP]
+ * with tighter inner padding, so the text keeps its size and is never
+ * clipped (Material's own field cannot go below 56 dp).
+ */
+@Composable
+private fun CompactIconTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    leading: ImageVector,
+    enabled: Boolean,
+    visualTransformation: VisualTransformation,
+    trailing: @Composable (() -> Unit)?,
+    trailingFocused: () -> Boolean,
+    keyboardOptions: androidx.compose.foundation.text.KeyboardOptions,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors()
+    val textColor = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    androidx.compose.foundation.text.BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth()
+            .height(com.aeriotv.android.feature.settings.ProfileDialogRules.TvForm.FIELD_HEIGHT_DP.dp)
+            .tvFormFieldInput(
+                horizontalFocusEscape = trailing != null,
+                okSuppressed = trailingFocused,
+            ),
+        enabled = enabled,
+        singleLine = true,
+        textStyle = androidx.compose.material3.LocalTextStyle.current.copy(color = textColor),
+        cursorBrush = androidx.compose.ui.graphics.SolidColor(MaterialTheme.colorScheme.primary),
+        visualTransformation = visualTransformation,
+        keyboardOptions = keyboardOptions,
+        interactionSource = interaction,
+        decorationBox = { inner ->
+            androidx.compose.material3.OutlinedTextFieldDefaults.DecorationBox(
+                value = value,
+                innerTextField = inner,
+                enabled = enabled,
+                singleLine = true,
+                visualTransformation = visualTransformation,
+                interactionSource = interaction,
+                placeholder = { Text(placeholder, style = androidx.compose.material3.LocalTextStyle.current.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) },
+                leadingIcon = {
+                    Icon(
+                        imageVector = leading,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                trailingIcon = trailing,
+                colors = colors,
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                container = {
+                    androidx.compose.material3.OutlinedTextFieldDefaults.Container(
+                        enabled = enabled,
+                        isError = false,
+                        interactionSource = interaction,
+                        colors = colors,
+                    )
+                },
+            )
+        },
+    )
+}
 
 @Composable
 internal fun PasswordField(
@@ -940,7 +1016,20 @@ internal fun SegmentedAuthControl(
     selected: DispatcharrAuthMode,
     onSelect: (DispatcharrAuthMode) -> Unit,
     enabled: Boolean,
+    /**
+     * Add Profile (Apple parity): two capsules sized to their labels, the
+     * selected one filled, so "Username & Password" fits on one line in a
+     * dialog. The connect form keeps the full-width track.
+     */
+    capsules: Boolean = false,
 ) {
+    if (capsules) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            AuthModeCapsule("Username & Password", selected == DispatcharrAuthMode.UsernamePassword, enabled) { onSelect(DispatcharrAuthMode.UsernamePassword) }
+            AuthModeCapsule("API Key", selected == DispatcharrAuthMode.ApiKey, enabled) { onSelect(DispatcharrAuthMode.ApiKey) }
+        }
+        return
+    }
     val cornerRadius = 22.dp
     Row(
         modifier = Modifier
@@ -973,6 +1062,29 @@ internal fun SegmentedAuthControl(
 }
 
 @Composable
+private fun AuthModeCapsule(label: String, isSelected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(50)
+    Box(
+        modifier = Modifier
+            .dpadFocusRing(shape, washTint = MaterialTheme.colorScheme.primary, onFilled = isSelected)
+            .clip(shape)
+            .background(if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.primary.copy(alpha = 0.14f))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = if (com.aeriotv.android.feature.settings.LocalTvCompactForm.current) 6.dp else 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+            color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+@Composable
 private fun SegmentItem(
     label: String,
     isSelected: Boolean,
@@ -988,7 +1100,11 @@ private fun SegmentItem(
             .clip(RoundedCornerShape(18.dp))
             .background(bg)
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 10.dp),
+            .padding(
+                vertical = if (com.aeriotv.android.feature.settings.LocalTvCompactForm.current) {
+                    com.aeriotv.android.feature.settings.ProfileDialogRules.TvForm.SEGMENT_PADDING_DP.dp
+                } else 10.dp,
+            ),
         contentAlignment = Alignment.Center,
     ) {
         Text(

@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.material.icons.filled.Palette
 import com.aeriotv.android.ui.scale.subtext
 import com.aeriotv.android.ui.theme.textAccent
@@ -176,8 +177,10 @@ fun AppearanceSettingsScreen(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.TopCenter,
         ) {
+            val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
             LazyColumn(
-                modifier = Modifier.settingsFormWidth(),
+                state = paneList,
+                modifier = Modifier.settingsFormWidth().settingsPaneTopEdge(paneList),
                 // Bottom padding covers the bottom-nav bar (~80 dp) plus
                 // 24 dp breathing room, so the last LazyColumn item ("Reset
                 // Colors to Defaults" under the Palette card) isn't clipped
@@ -191,7 +194,7 @@ fun AppearanceSettingsScreen(
                     top = 12.dp,
                     bottom = LocalTabBarBottomInset.current,
                 ),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
             ) {
                 // COLOR THEME card - the brand presets. Apple splits the old
                 // combined "Theme" card into Color Theme / Light and Dark Mode
@@ -533,7 +536,7 @@ internal fun ThemeRow(
         modifier = modifier
             .settingsRowFocusCard()
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Apple parity: a plain 22dp accent dot with a hairline ring, no
@@ -605,7 +608,7 @@ private fun ThemeColorRow(hex: String, onPick: () -> Unit) {
             .fillMaxWidth()
             .settingsRowFocusCard()
             .clickable(onClick = onPick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -619,12 +622,12 @@ private fun ThemeColorRow(hex: String, onPick: () -> Unit) {
                     shape = RoundedCornerShape(4.dp),
                 ),
         )
-        Spacer(Modifier.size(14.dp))
+        Spacer(Modifier.size(com.aeriotv.android.ui.settings.settingsTileGap()))
         Text(
             text = "Theme Color",
             style = if (isTv) com.aeriotv.android.ui.settings.settingsRowTitleStyle() else MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onBackground,
-            fontWeight = FontWeight.Medium,
+            fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             modifier = Modifier.weight(1f),
         )
         Text(
@@ -645,7 +648,7 @@ private fun ColorSheetRow(title: String, hex: String, onPick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onPick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -715,7 +718,7 @@ private fun CustomAccentRow(
                 onToggle(next)
                 if (next && hex.isBlank()) onPick()
             }
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         val isTv = rememberIsTvDevice()
@@ -741,20 +744,20 @@ private fun CustomAccentRow(
                     shape = RoundedCornerShape(4.dp),
                 ),
         )
-        Spacer(Modifier.size(14.dp))
+        Spacer(Modifier.size(com.aeriotv.android.ui.settings.settingsTileGap()))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = "Custom Accent Color",
                 style = if (isTv) com.aeriotv.android.ui.settings.settingsRowTitleStyle() else MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.Medium,
+                fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             )
             // iOS has no subtitle (the section footer explains the row);
             // tvOS carries this one.
             if (rememberIsTvDevice()) {
                 Text(
                     text = "Override the theme accent with a custom hex color",
-                    style = com.aeriotv.android.ui.settings.settingsFootnoteStyle(),
+                    style = com.aeriotv.android.ui.settings.settingsRowSubtitleOrFootnote(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -880,7 +883,7 @@ private fun TvPreviewRow(theme: AppTheme, accent: Color) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 4.dp),
+                .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -939,7 +942,7 @@ internal fun ToggleRow(
             .fillMaxWidth()
             .settingsRowFocusCard()
             .clickable { onCheckedChange(!checked) }
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -1094,8 +1097,12 @@ internal fun ScaleSliderRow(
     segments: List<Pair<Float, String>> = SCALE_SEGMENTS,
 ) {
     // tvOS renders Display Scale as inline percentage segments, not a slider
-    // (cleaner with a remote + no focus-trap). The selected segment is filled.
+    // (cleaner with a remote + no focus-trap): Apple TV's pill row.
     val isTv = rememberIsTvDevice()
+    if (isTv) {
+        TvSegmentsRow(label = label, value = value, onValueChange = onValueChange, modifier = modifier, segments = segments)
+        return
+    }
     BoxWithConstraints(modifier = modifier) {
         // TV always keeps the single-line row (10-foot layout is wide and the
         // D-pad expects one horizontal axis). Everywhere else it depends on
@@ -1147,7 +1154,7 @@ internal fun ScaleSliderRow(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 labelText(Modifier.weight(1f))
@@ -1157,11 +1164,83 @@ internal fun ScaleSliderRow(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                    .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 labelText(Modifier.fillMaxWidth())
                 segments(Modifier.fillMaxWidth())
+            }
+        }
+    }
+}
+
+/**
+ * Apple TV's segmented Settings row (PlayerSettingsView tvSteppedSegmentsRow
+ * with TVSettingsPill), halved: the title (24 pt) then one capsule per stop,
+ * 24 pt apart, 10 pt above and below. A chip is a 22 pt medium label in
+ * 14 by 8 pt padding; the selected chip is the solid accent with the page's
+ * color as ink, the others the secondary ink; focus adds the accent at 18%
+ * under the label and a 2 pt accent ring in the 3 pt around the chip. Each
+ * chip is a focus stop and OK picks it. Display Scale, Skip Back and Skip
+ * Forward, Channels to Keep, and both Logo Size rows use it on TV, as tvOS.
+ */
+@Composable
+internal fun TvSegmentsRow(
+    label: String,
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier,
+    segments: List<Pair<Float, String>>,
+) {
+    Row(
+        // Apple pads 20 by 10 pt. Sideways this keeps the 16 dp every other
+        // Android TV pane row uses, so the title lines up with theirs as
+        // Apple TV's does.
+        modifier = modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = label,
+            style = com.aeriotv.android.ui.settings.settingsRowTitleStyle(),
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
+            modifier = Modifier.weight(1f),
+        )
+        segments.forEach { (segValue, segLabel) ->
+            val selected = kotlin.math.abs(value - segValue) < 0.03f
+            var focused by remember { mutableStateOf(false) }
+            Box(
+                modifier = Modifier
+                    .onFocusChanged { focused = it.isFocused }
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                    ) { onValueChange(segValue) }
+                    .then(if (focused) Modifier.border(1.dp, MaterialTheme.colorScheme.primary, CircleShape) else Modifier)
+                    .padding(1.5.dp),
+            ) {
+                Text(
+                    text = segLabel,
+                    style = com.aeriotv.android.ui.settings.settingsRowValueStyle(),
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    color = when {
+                        selected -> MaterialTheme.colorScheme.background
+                        focused -> MaterialTheme.colorScheme.textAccent
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(
+                            when {
+                                selected -> MaterialTheme.colorScheme.primary
+                                focused -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                                else -> Color.Transparent
+                            },
+                        )
+                        .padding(horizontal = 7.dp, vertical = 4.dp),
+                )
             }
         }
     }
@@ -1180,7 +1259,7 @@ internal fun CategoryPaletteRow(
         modifier = modifier
             .settingsRowFocusCard()
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
@@ -1226,7 +1305,7 @@ internal fun AddMoreCategoriesRow(
             .fillMaxWidth()
             .settingsRowFocusCard()
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {

@@ -40,14 +40,12 @@ import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Schedule
-import com.aeriotv.android.ui.scale.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import com.aeriotv.android.ui.scale.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -239,10 +237,20 @@ fun DvrMediaTabContent(
         else (row.positionMs / (if (row.durationMs > 0) row.durationMs.toDouble() else total.coerceAtLeast(1.0))).toFloat().coerceIn(0f, 1f)
     }
 
-    val recordings = state.recordings
+    // Kept from a deleted playlist: their own section, not the library (DvrSavedOnDevice).
+    val savedOnDevice = remember(state.recordings) { state.recordings.filter { it.savedOnDevice }.sortedByDescending { it.startMillis } }
+    val recordings = remember(state.recordings) { state.recordings.filterNot { it.savedOnDevice } }
     val recordingNow = remember(recordings, now) { recordings.filter { it.effectiveStatus(now) == DvrViewModel.Recording.Status.Recording }.sortedByDescending { it.startMillis } }
     val scheduled = remember(recordings, now) { recordings.filter { it.effectiveStatus(now) == DvrViewModel.Recording.Status.Scheduled }.sortedBy { it.startMillis } }
-    val completed = remember(recordings, now) { recordings.filter { val s = it.effectiveStatus(now); s == DvrViewModel.Recording.Status.Completed || s == DvrViewModel.Recording.Status.Stopped } }
+    // An on-device recording that captured nothing is listed as Failed
+    // (Logan 2026-11-13: "Otherwise the user just thinks it is missing").
+    val completed = remember(recordings, now) {
+        recordings.filter {
+            val s = it.effectiveStatus(now)
+            s == DvrViewModel.Recording.Status.Completed || s == DvrViewModel.Recording.Status.Stopped ||
+                (s == DvrViewModel.Recording.Status.Failed && it.source == DvrViewModel.Source.Local)
+        }
+    }
     val continueWatching = remember(recordingNow, completed, recent) {
         recordingNow + completed.filter { val p = progressOf(it); p > 0f && p < 0.97f }.sortedByDescending { it.startMillis }
     }
@@ -340,7 +348,8 @@ fun DvrMediaTabContent(
                 fileSizeBytes = rec.fileSizeBytes,
                 format = if (ext.equals("m3u8", true)) "HLS" else ext,
                 location = if (rec.source == DvrViewModel.Source.Local) "This Device" else (playlistState.playlist?.name?.takeIf { it.isNotBlank() } ?: "Dispatcharr"),
-                status = statusLabel,
+                // Apple shows a failed recording's reason with its status.
+                status = rec.failureReason?.let { "$statusLabel: $it" } ?: statusLabel,
                 videoCodec = rec.videoCodec, resolution = rec.resolution, frameRate = rec.frameRate,
                 videoBitrateKbps = rec.videoBitrateKbps, audioCodec = rec.audioCodec, audioChannels = rec.audioChannels,
             ),
@@ -356,7 +365,8 @@ fun DvrMediaTabContent(
             add(com.aeriotv.android.core.tv.TvMenuAction("Program Info") { showInfo(rec) })
             if (s == DvrViewModel.Recording.Status.Completed || s == DvrViewModel.Recording.Status.Stopped) {
                 // Apple parity: same label and action as the card's primary button.
-                add(com.aeriotv.android.core.tv.TvMenuAction(if (progressOf(rec) > 0f) "Resume" else "Play") { play(rec) })
+                // Not for a file that is gone (shown as missing; Delete from Device stays).
+                if (!rec.fileMissing) add(com.aeriotv.android.core.tv.TvMenuAction(if (progressOf(rec) > 0f) "Resume" else "Play") { play(rec) })
                 if (isServer) {
                     add(com.aeriotv.android.core.tv.TvMenuAction("Watch from Beginning") { playFromStart(rec) })
                     // Save to Device is a read (GET the file), never gated.
@@ -401,7 +411,7 @@ fun DvrMediaTabContent(
         }
     }
 
-    if (recordings.isEmpty() && !state.isLoading) {
+    if (recordings.isEmpty() && savedOnDevice.isEmpty() && !state.isLoading) {
         Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding()) {
             Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("No Recordings", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground)
@@ -432,6 +442,7 @@ fun DvrMediaTabContent(
             TvDvrPage(
                 gridState = gridState, now = now,
                 continueWatching = continueWatching, recordingNow = recordingNow, scheduled = scheduled,
+                savedOnDevice = savedOnDevice,
                 recentRecordings = recentRecordings, filteredLibrary = filteredLibrary, available = available,
                 channelName = channelName, channelLogo = channelLogo, progressOf = progressOf,
                 kindPills = kindPills, selectedKind = selectedKind, onKind = { selectedKind = it },
@@ -461,19 +472,34 @@ fun DvrMediaTabContent(
                 ),
                 PageDeck("Recently Recorded", if (recentRecordings.size > 1) recentRecordings else emptyList(), { it.id }, recentCard),
             ),
-            rows = if (scheduled.isEmpty()) emptyList() else listOf(PageRow("scheduled") {
-                Column {
-                    PageSectionTitle("Scheduled")
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        items(scheduled.size, key = { scheduled[it].id }) { i ->
-                            val rec = scheduled[i]
-                            Box(modifier = Modifier.width(150.dp)) {
-                                DvrPosterCard(rec, channelLogo(rec), 0f, now, onClick = { showInfo(rec) }, menu = { close -> menuItems(rec, close) })
+            rows = buildList {
+                if (scheduled.isNotEmpty()) add(PageRow("scheduled") {
+                    Column {
+                        PageSectionTitle("Scheduled")
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            items(scheduled.size, key = { scheduled[it].id }) { i ->
+                                val rec = scheduled[i]
+                                Box(modifier = Modifier.width(150.dp)) {
+                                    DvrPosterCard(rec, channelLogo(rec), 0f, now, onClick = { showInfo(rec) }, menu = { close -> menuItems(rec, close) })
+                                }
                             }
                         }
                     }
-                }
-            }),
+                })
+                if (savedOnDevice.isNotEmpty()) add(PageRow(DvrSavedOnDevice.HEADER_KEY) {
+                    Column {
+                        PageSectionTitle(DvrSavedOnDevice.TITLE)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            items(savedOnDevice.size, key = { savedOnDevice[it].id }) { i ->
+                                val rec = savedOnDevice[i]
+                                Box(modifier = Modifier.width(150.dp)) {
+                                    DvrPosterCard(rec, channelLogo(rec), progressOf(rec), now, onClick = { play(rec) }, menu = { close -> menuItems(rec, close) })
+                                }
+                            }
+                        }
+                    }
+                })
+            },
             headerTitle = if (isSearching) "Results" else "All Recordings",
             headerCount = filteredLibrary.size,
             sortMenu = {
@@ -504,7 +530,8 @@ fun DvrMediaTabContent(
             cell = { rec -> DvrPosterCard(rec, channelLogo(rec), progressOf(rec), now, onClick = { play(rec) }, menu = { close -> menuItems(rec, close) }) },
             emptyContent = {
                 if (state.isLoading) CircularProgressIndicator()
-                else Text("No Recordings", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // Only "Saved on this device" recordings: that row is the page.
+                else if (savedOnDevice.isEmpty()) Text("No Recordings", color = MaterialTheme.colorScheme.onSurfaceVariant)
             },
             railLetters = available,
             railIndexOf = { letter -> filteredLibrary.indexOfFirst { bucket(it.title) == letter } },
@@ -546,18 +573,14 @@ fun DvrMediaTabContent(
     }
     pendingDelete?.let { rec ->
         val scheduledNow = rec.effectiveStatus(now) == DvrViewModel.Recording.Status.Scheduled
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingDelete = null },
-            title = {
-                Text(
-                    when {
-                        scheduledNow -> "Cancel Recording"
-                        rec.source == DvrViewModel.Source.Server -> "Delete from Server"
-                        else -> "Delete from Device"
-                    },
-                )
+            title = when {
+                scheduledNow -> "Cancel Recording"
+                rec.source == DvrViewModel.Source.Server -> "Delete from Server"
+                else -> "Delete from Device"
             },
-            text = {
+            content = {
                 Text(
                     when {
                         scheduledNow -> "Cancel the scheduled recording of \"${rec.title}\"?"
@@ -567,16 +590,19 @@ fun DvrMediaTabContent(
                     },
                 )
             },
-            confirmButton = {
-                TextButton(onClick = {
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction(if (scheduledNow) "Cancel Recording" else "Delete", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
                     val target = rec; pendingDelete = null
                     scope.launch { viewModel.deleteRecording(target).onFailure { toast("Delete failed: ${it.message}") } }
-                }) { Text(if (scheduledNow) "Cancel Recording" else "Delete", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Keep") } },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Keep", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingDelete = null },
+            ),
         )
     }
 }
+
+/** SwiftUI's Color.gray (rgb 142, 142, 147), the Missing badge's fill. */
+private val DvrMissingGrey = Color(0xFF8E8E93)
 
 private fun metaLine(rec: Rec, now: Long): String {
     val day = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(rec.startMillis))
@@ -584,7 +610,7 @@ private fun metaLine(rec: Rec, now: Long): String {
     val second = when (s) {
         DvrViewModel.Recording.Status.Recording -> "Recording"
         DvrViewModel.Recording.Status.Scheduled -> DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(rec.startMillis))
-        else -> { val m = ((rec.endMillis - rec.startMillis) / 60_000L).toInt(); if (m >= 60) "${m / 60} h ${m % 60} min" else "$m min" }
+        else -> DvrFormat.duration(rec.endMillis - rec.startMillis)
     }
     val se = if ((rec.season ?: 0) > 0) "S${rec.season} E${rec.episode ?: 0}" else null
     return listOfNotNull(day, second, se).joinToString(" · ")
@@ -617,6 +643,21 @@ fun DvrPosterCard(
                     Box(modifier = Modifier.size(5.dp).clip(CircleShape).background(Color(0xFFFF4757)))
                     Text("REC", fontSize = 9.sp, fontWeight = FontWeight.Black, color = Color(0xFFFF4757))
                 }
+            }
+            if (rec.effectiveStatus(now) == DvrViewModel.Recording.Status.Failed) {
+                // Apple's status wording and red (MyRecordingsView statusInfo).
+                Text(
+                    "Failed", fontSize = 9.sp, fontWeight = FontWeight.Black, color = Color(0xFFFF4757),
+                    modifier = Modifier.align(Alignment.TopStart).padding(5.dp).clip(RoundedCornerShape(4.dp))
+                        .background(Color.Black.copy(alpha = 0.7f)).padding(horizontal = 5.dp, vertical = 3.dp),
+                )
+            } else if (rec.fileMissing) {
+                // Apple 743bd6b: "Missing", white on grey at 85%.
+                Text(
+                    "Missing", fontSize = 9.sp, fontWeight = FontWeight.Black, color = Color.White,
+                    modifier = Modifier.align(Alignment.TopStart).padding(5.dp).clip(RoundedCornerShape(4.dp))
+                        .background(DvrMissingGrey.copy(alpha = 0.85f)).padding(horizontal = 5.dp, vertical = 3.dp),
+                )
             }
             if (progress > 0f) {
                 Box(modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().height(3.dp).background(Color.Black.copy(alpha = 0.45f))) {
@@ -665,7 +706,8 @@ fun DvrHeroCard(
             }
             Text(rec.title, fontSize = 22.sp, fontWeight = FontWeight.Bold, lineHeight = 26.sp, color = MaterialTheme.colorScheme.onBackground, maxLines = 2, overflow = TextOverflow.Ellipsis)
             rec.subTitle?.takeIf { it.isNotBlank() }?.let { Text(it, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onBackground, maxLines = 1, overflow = TextOverflow.Ellipsis) }
-            val meta = listOfNotNull(channelName.takeIf { it.isNotBlank() }, metaLine(rec, now)).joinToString(" · ")
+            // On this device, but its file is gone: say so (Delete from Device stays).
+            val meta = listOfNotNull(channelName.takeIf { it.isNotBlank() }, metaLine(rec, now), "File missing".takeIf { rec.fileMissing }).joinToString(" · ")
             Text(meta, fontSize = 13.sp.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 4.dp)) {
                 if (recording) {
@@ -674,7 +716,8 @@ fun DvrHeroCard(
                         HeroRound(Icons.Filled.Sensors, "Jump to Live", onSecondary)
                     }
                     if (canManage) HeroRound(Icons.Filled.Stop, "Stop Recording", onStop)
-                } else {
+                } else if (rec.effectiveStatus(now) != DvrViewModel.Recording.Status.Failed && !rec.fileMissing) {
+                    // A failed recording, or one whose file is gone, has nothing to play.
                     HeroPill(if (progress > 0f) "Resume" else "Play", Icons.Filled.PlayArrow, primary = true, onPrimary)
                     if (progress > 0f) HeroRound(Icons.Filled.Replay, "Play from Beginning", onSecondary)
                 }
@@ -727,6 +770,8 @@ private fun TvDvrPage(
     recordingNow: List<Rec>,
     scheduled: List<Rec>,
     recentRecordings: List<Rec>,
+    /** Kept from a deleted playlist (DvrSavedOnDevice). */
+    savedOnDevice: List<Rec>,
     filteredLibrary: List<Rec>,
     available: Set<Char>,
     channelName: (Rec) -> String,
@@ -760,10 +805,7 @@ private fun TvDvrPage(
     val red = Color(0xFFFF4757)
     val timeFmt = remember { DateFormat.getTimeInstance(DateFormat.SHORT) }
     fun timeRange(rec: Rec): String = timeFmt.format(Date(rec.startMillis)) + " to " + timeFmt.format(Date(rec.endMillis))
-    fun durationLabel(rec: Rec): String {
-        val m = ((rec.endMillis - rec.startMillis) / 60_000L).toInt()
-        return if (m >= 60) "${m / 60} h ${m % 60} min" else "$m min"
-    }
+    fun durationLabel(rec: Rec): String = DvrFormat.duration(rec.endMillis - rec.startMillis)
     // A hero action opens a ROUTE over MAIN: arm the return state so Back
     // lands back on the button that was pressed (the page records WHICH one).
     val armHero: () -> Unit = { com.aeriotv.android.feature.movies.tv.TvReturnMemory.arm("dvr", null, gridState) }
@@ -774,7 +816,11 @@ private fun TvDvrPage(
         val se = if ((rec.season ?: 0) > 0) "S${rec.season} E${rec.episode ?: 0}" else null
         // tvOS DVRHero metaParts: channel, "Sep 5 1:36 AM to 2:00 AM", S/E or duration.
         val dateRange = java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(Date(rec.startMillis)) + " " + timeRange(rec)
-        val meta = listOfNotNull(channelName(rec).takeIf { it.isNotBlank() }, dateRange, se ?: durationLabel(rec))
+        val meta = listOfNotNull(
+            channelName(rec).takeIf { it.isNotBlank() }, dateRange, se ?: durationLabel(rec),
+            // On this device, but its file is gone: say so (Delete from Device stays).
+            "File missing".takeIf { rec.fileMissing },
+        )
         val buttons = buildList {
             if (recording) {
                 if (canPlay) {
@@ -784,7 +830,8 @@ private fun TvDvrPage(
                 if (canManageDvr || rec.source != DvrViewModel.Source.Server) {
                     add(com.aeriotv.android.feature.movies.tv.TvHeroButton("Stop Recording", Icons.Filled.Stop, id = "Stop") { onStop(rec) })
                 }
-            } else {
+            } else if (rec.effectiveStatus(now) != DvrViewModel.Recording.Status.Failed && !rec.fileMissing) {
+                // A failed recording, or one whose file is gone, has nothing to play.
                 add(com.aeriotv.android.feature.movies.tv.TvHeroButton(if (progress > 0f) "Resume" else "Play", Icons.Filled.PlayArrow, primary = true, id = "Primary") { armHero(); onPlay(rec) })
                 if (progress > 0f) add(com.aeriotv.android.feature.movies.tv.TvHeroButton("Play from Beginning", Icons.Filled.Replay, id = "FromStart") { armHero(); onPlayFromStart(rec) })
             }
@@ -823,7 +870,14 @@ private fun TvDvrPage(
             badge = when (s) {
                 DvrViewModel.Recording.Status.Recording -> com.aeriotv.android.feature.movies.tv.TvRecordingBadge("REC", red, dot = true)
                 DvrViewModel.Recording.Status.Scheduled -> com.aeriotv.android.feature.movies.tv.TvRecordingBadge(day, Color.Black.copy(alpha = 0.6f), icon = Icons.Outlined.Schedule)
-                else -> if (rec.partial) com.aeriotv.android.feature.movies.tv.TvRecordingBadge("Partial", Color(0xFFFF9F43).copy(alpha = 0.85f)) else null
+                // Apple's status wording and red (MyRecordingsView statusInfo).
+                DvrViewModel.Recording.Status.Failed -> com.aeriotv.android.feature.movies.tv.TvRecordingBadge("Failed", red.copy(alpha = 0.85f))
+                else -> when {
+                    // Apple 743bd6b: "Missing" on grey at 85%, before Partial.
+                    rec.fileMissing -> com.aeriotv.android.feature.movies.tv.TvRecordingBadge("Missing", DvrMissingGrey.copy(alpha = 0.85f))
+                    rec.partial -> com.aeriotv.android.feature.movies.tv.TvRecordingBadge("Partial", Color(0xFFFF9F43).copy(alpha = 0.85f))
+                    else -> null
+                }
             },
             onClick = onClick, modifier = modifier, longPressActions = menuActions(rec),
         )
@@ -872,6 +926,7 @@ private fun TvDvrPage(
             shelf("Recording Now", recordingNow) { onPlay(it) },
             shelf("Scheduled", scheduled) { onInfo(it) },
             shelf("Recent Recordings", if (recentRecordings.size > 1) recentRecordings else emptyList()) { onPlay(it) },
+            shelf(DvrSavedOnDevice.TITLE, savedOnDevice) { onPlay(it) },
         ),
         headerTitle = if (isSearching) "Results" else "All Recordings",
         headerCount = filteredLibrary.size,
@@ -905,7 +960,7 @@ private fun TvDvrPage(
         },
         emptyContent = {
             if (isLoading) com.aeriotv.android.ui.tv.TvGatedSpinner()
-            else Text("No Recordings", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            else if (savedOnDevice.isEmpty()) Text("No Recordings", color = MaterialTheme.colorScheme.onSurfaceVariant)
         },
         isLoading = isLoading,
         railLetters = available,

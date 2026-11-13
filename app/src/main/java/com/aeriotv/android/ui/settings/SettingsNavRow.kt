@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -87,6 +89,14 @@ fun SettingsNavRow(
      * the accent.
      */
     iconTint: Color? = null,
+    /**
+     * TV Settings rail (Apple 08c1be8): rows at least this tall with the
+     * text centered and Apple's 9 dp side padding, so the rail's pitch is
+     * exact. Null keeps the padded height.
+     */
+    railMinHeight: androidx.compose.ui.unit.Dp? = null,
+    /** The rail glyph's box for this row (sp, follows Text Size); null keeps [TvSettingsMetrics.railIconGlyph]. */
+    railIconGlyph: androidx.compose.ui.unit.TextUnit? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
     val isTv = rememberIsTvDevice()
@@ -103,10 +113,20 @@ fun SettingsNavRow(
     // halved for the 960x540dp canvas - see that file for why halving is the
     // correct conversion. Touch keeps the phone/tablet values.
     val iconBox = if (isTv) TvSettingsMetrics.railIconWidth else SettingsCardMetrics.iconTile
-    val iconGlyph = if (isTv) TvSettingsMetrics.railIconGlyph else SettingsCardMetrics.iconGlyph
+    // The Settings rail's glyph is sp-sized, so it follows Text Size as
+    // Apple's scaledFont rail icon does.
+    val railGlyph = with(androidx.compose.ui.platform.LocalDensity.current) { (railIconGlyph ?: TvSettingsMetrics.railIconGlyph).toDp() }
+    val iconGlyph = when {
+        railMinHeight != null -> railGlyph
+        isTv -> TvSettingsMetrics.navIconGlyph
+        else -> SettingsCardMetrics.iconGlyph
+    }
     val gap = if (isTv) TvSettingsMetrics.railIconGap else 12.dp
-    val padH = if (isTv) 10.dp else 16.dp
-    val padV = if (isTv) 2.dp else 12.dp
+    val padH = if (railMinHeight != null) TvSettingsMetrics.railRowPaddingH else if (isTv) 10.dp else 16.dp
+    // Touch card rows (the Settings root's App and Device rows): Apple's
+    // standard row is 69.7 dp tall on iPhone (6fde56b); 12 dp padding made
+    // these 65.5. Flat rows (the tablet sidebar) keep 12.
+    val padV = if (railMinHeight != null) 0.dp else if (isTv) 2.dp else if (flat) 12.dp else 14.dp
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -115,12 +135,20 @@ fun SettingsNavRow(
                 if (flat) {
                     // Plain row; fill only for focus (D-pad affordance) or
                     // selection, and a border only on focus.
+                    // The TV Settings rail (railMinHeight) is Apple's
+                    // TVRailRowStyle: no focus scale (a focused row keeps its
+                    // siblings' frame), a 7 dp corner (tvOS 14), the accent
+                    // wash and a full accent ring on focus, and the card fill
+                    // for the selected row.
+                    val rail = railMinHeight != null
+                    val shape = RoundedCornerShape(if (rail) 7.dp else 12.dp)
                     Modifier
-                        .tvFocusScale(focused, focusedScale = 1.02f)
-                        .clip(RoundedCornerShape(12.dp))
+                        .then(if (rail) Modifier else Modifier.tvFocusScale(focused, focusedScale = 1.02f))
+                        .clip(shape)
                         .background(
                             when {
                                 focused -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                                selected && rail -> settingsCardFill()
                                 // Phase 3b: selection is a quiet accent wash,
                                 // not Material's off-palette secondaryContainer.
                                 selected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
@@ -131,8 +159,9 @@ fun SettingsNavRow(
                             if (focused) {
                                 Modifier.border(
                                     2.dp,
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
-                                    RoundedCornerShape(12.dp),
+                                    if (rail) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.primary.copy(alpha = 0.65f),
+                                    shape,
                                 )
                             } else Modifier,
                         )
@@ -156,6 +185,7 @@ fun SettingsNavRow(
                 },
             )
             .clickable(onClick = onClick)
+            .then(if (railMinHeight != null) Modifier.heightIn(min = railMinHeight) else Modifier)
             .padding(horizontal = padH, vertical = padV),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -183,7 +213,10 @@ fun SettingsNavRow(
                 imageVector = icon,
                 contentDescription = null,
                 tint = iconTint ?: MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(iconGlyph),
+                // A rail glyph may be wider than the 17 dp column (Material
+                // pads its glyphs inside the box more than SF Symbols do), so
+                // it is drawn at its own size, centered, without moving the text.
+                modifier = if (railMinHeight != null) Modifier.requiredSize(iconGlyph) else Modifier.size(iconGlyph),
             )
         }
         Spacer(Modifier.size(gap))

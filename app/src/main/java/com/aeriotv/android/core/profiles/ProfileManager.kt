@@ -86,7 +86,7 @@ class ProfileManager @Inject constructor(
             override fun read(): String? = prefs.getString("state.v1", null)
             override fun write(value: String) { prefs.edit().putString("state.v1", value).commit() }
         },
-    )
+    ).also { StoredSecrets.book = it }
 
     /** Playlist ids whose channel list / groups / VOD must reload after a
      *  profile switch. A Channel so exactly one PlaylistViewModel handles it. */
@@ -188,7 +188,7 @@ class ProfileManager @Inject constructor(
         }
         refreshActiveRole(pid)
         if (active != null && !active.isDefault && active.playlistId == pid) {
-            ProfileScope.activate(active.toOverlay())
+            ProfileScope.activate(active.toOverlay(), ProfileScope.Why.LAUNCH)
             Log.i(TAG, "[PROFILE] restored ${active.displayName} on ${pid.take(8)}")
         }
         // PIN: a locked restored profile (the default one included) shows the
@@ -249,7 +249,9 @@ class ProfileManager @Inject constructor(
      */
     suspend fun pickAtLaunch(profileId: String): Result<Unit> {
         val pk = _launchPicker.value ?: return Result.success(Unit)
-        if (pinStore.hasPin(profileId) && !switchTickets.contains(profileId)) return Result.failure(IllegalStateException("Enter PIN"))
+        if (pinStore.hasPin(profileId) && !switchTickets.contains(profileId)) {
+            return Result.failure(IllegalStateException(PinCopy.switchNeedsPin(store.byId(profileId)?.displayName.orEmpty())))
+        }
         if (profileId == activeProfileIdNow(pk.playlistId) && !unusable(profileId)) {
             switchTickets.remove(profileId)
             _launchPicker.value = null
@@ -385,14 +387,14 @@ class ProfileManager @Inject constructor(
         } else {
             check(onboarding || RoleRules.isFullAccess(activeRole(playlistId))) { "Only an Admin or Standard profile can set the Device Admin PIN." }
         }
-        check(pinStore.set(id, type, entries)) { "Enter 4 to 6" }
+        check(pinStore.set(id, type, entries)) { PinCopy.PIN_LENGTH }
         Log.i(TAG, "[PROFILE] device admin pin set on ${playlistId.take(8)}")
     }
 
     /** Null = removable; otherwise why the device PIN must stay. */
     fun deviceAdminPinRemovalBlock(playlistId: String): String? =
         if (RoleRules.canRemoveDevicePin(anyChild(playlistId), adminPinHolders(playlistId).size)) null
-        else "This is the last PIN that can leave a Child profile, so it stays while any profile is a Child."
+        else PinCopy.DEVICE_ADMIN_PIN_STAYS
 
     fun removeDeviceAdminPin(playlistId: String, current: List<String>): Result<Unit> = runCatching {
         val id = deviceAdminPinId(playlistId)
@@ -424,7 +426,7 @@ class ProfileManager @Inject constructor(
     private val adminTickets = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
-     * "Enter a PIN from an Admin or Standard profile": any full-access
+     * "Enter an Admin or Standard profile PIN, or the Device Admin PIN": any full-access
      * profile's PIN (or the Device Admin PIN) on [playlistId] passes. Each
      * keeps its own wrong-PIN backoff. Ok grants one ticket and a switch
      * ticket for the matching profile.
@@ -497,7 +499,7 @@ class ProfileManager @Inject constructor(
         when (val g = roleChangeGate(playlistId, profileId, to)) {
             is RoleRules.RoleChange.Denied -> error(g.reason)
             RoleRules.RoleChange.NeedsPinsCreated -> error(RoleRules.KEEP_PIN_REASON)
-            RoleRules.RoleChange.NeedsPinEntry -> check(consumeAdminTicket(playlistId)) { "Enter a PIN from an Admin or Standard profile" }
+            RoleRules.RoleChange.NeedsPinEntry -> check(consumeAdminTicket(playlistId)) { PinCopy.ADMIN_PAD }
             RoleRules.RoleChange.Allowed -> Unit
         }
         val from = target.effectiveRole()
@@ -599,7 +601,7 @@ class ProfileManager @Inject constructor(
             RoleRules.ResetGate.ConfirmOnly -> Unit
         }
         if (replacement != null) {
-            check(pinStore.set(profileId, replacement.first, replacement.second)) { "Enter 4 to 6" }
+            check(pinStore.set(profileId, replacement.first, replacement.second)) { PinCopy.PIN_LENGTH }
             mutated(profileId, "pin reset")
             Log.i(TAG, "[PROFILE] pin reset to a temporary pin for ${store.byId(profileId)?.username}")
         } else {
@@ -622,7 +624,7 @@ class ProfileManager @Inject constructor(
             check(verifyPin(profileId, current.orEmpty()) == PinCheck.Ok) { "Wrong PIN" }
             switchTickets.remove(profileId)
         }
-        check(pinStore.set(profileId, type, entries)) { "Enter 4 to 6" }
+        check(pinStore.set(profileId, type, entries)) { PinCopy.PIN_LENGTH }
         pendingPinAdds.remove(profileId)
         mutated(profileId, "pin set")
         Log.i(TAG, "[PROFILE] pin ${if (had) "changed" else "set"} for ${store.byId(profileId)?.username}")
@@ -708,7 +710,8 @@ class ProfileManager @Inject constructor(
                 .onFailure { Log.w(TAG, "[PROFILE] migration pass failed", it) }
             // Held playlists (a held Child may be active): the same-server check
             // runs in the background with the default profile's sign-in.
-            hostHolds.pausedPlaylists().forEach { scheduleSameServerCheck(it) }
+            // So does a playlist whose own route is still unproven (StoredSecrets).
+            (hostHolds.pausedPlaylists() + hostHolds.unprovenPlaylists()).forEach { scheduleSameServerCheck(it) }
             // Per-profile settings (2026-10-27): seed existing profiles once from the global values.
             runCatching { appPreferences.seedExistingProfilesOnce(store.profiles.value.filterNot { it.isDefault }.map { it.id }) }
                 .onFailure { Log.w(TAG, "[PROFILE] settings seed pass failed", it) }
@@ -720,7 +723,7 @@ class ProfileManager @Inject constructor(
     }
 
     private suspend fun onActivePlaylist(pid: String?) = mutex.withLock {
-        if (pid == null) { ProfileScope.activate(null); ProfileRoles.set(null); return@withLock }
+        if (pid == null) { ProfileScope.activate(null, ProfileScope.Why.PLAYLIST); ProfileRoles.set(null); return@withLock }
         store.lastActivePlaylistId = pid
         playlistDao.rawById(pid)?.let { ensureDefaultProfile(it) }
         var active = store.activeProfileId(pid)?.let(store::byId)
@@ -739,9 +742,9 @@ class ProfileManager @Inject constructor(
         }
         val current = ProfileScope.activeOverlay()
         if (active != null && !active.isDefault) {
-            if (current?.profileId != active.id) ProfileScope.activate(active.toOverlay())
+            if (current?.profileId != active.id) ProfileScope.activate(active.toOverlay(), ProfileScope.Why.PLAYLIST)
         } else if (current != null) {
-            ProfileScope.activate(null)
+            ProfileScope.activate(null, ProfileScope.Why.PLAYLIST)
         }
         refreshActiveRole(pid)
     }
@@ -823,6 +826,19 @@ class ProfileManager @Inject constructor(
      * anyone else, or a 403 from GET /api/accounts/users/, gets the manual
      * form (username, then password or API key, validated by signing in).
      */
+    /**
+     * Whether Add Profile opens on the manual form, known without the
+     * network (the base and active profile's levels), so the dialog opens
+     * once in its final shape instead of switching windows (the TV's double
+     * pop-up). A 403 on the users list can still turn an admin to manual.
+     */
+    suspend fun addStartsManual(playlistId: String): Boolean =
+        RoleRules.addPath(baseIsServerAdmin(playlistId) && activeIsAdmin(playlistId), usersListForbidden = false) == RoleRules.AddPath.Manual
+
+    /** The playlist's server and local URLs (a scanned user code must be for this server). */
+    suspend fun playlistUrls(playlistId: String): List<String?> =
+        playlistDao.rawById(playlistId)?.let { listOf(it.urlString, it.lanUrlString) } ?: emptyList()
+
     suspend fun addCandidates(playlistId: String): Result<AddCandidates> = runCatching {
         check(canAdd(playlistId)) { "Only an Admin or Standard profile can add profiles." }
         val serverAdmin = baseIsServerAdmin(playlistId) && activeIsAdmin(playlistId)
@@ -1426,7 +1442,7 @@ class ProfileManager @Inject constructor(
         check(!p.isDefault) { "The default profile cannot be removed." }
         check(RoleRules.isFullAccess(activeRole(p.playlistId))) { "Only an Admin or Standard profile can remove profiles." }
         if (RoleRules.removeNeedsPin(p.effectiveRole())) {
-            check(consumeAdminTicket(p.playlistId)) { "Enter a PIN from an Admin or Standard profile" }
+            check(consumeAdminTicket(p.playlistId)) { PinCopy.ADMIN_PAD }
         }
         deleteLocal(p, fromSync = false)
     }
@@ -1527,7 +1543,8 @@ class ProfileManager @Inject constructor(
         runCatching { watchlistStore.deleteScope(profileId) }
         runCatching { hiddenTitlesStore.deleteScope(profileId) }
         runCatching {
-            localRecordingDao.allOnceIn(profileId).forEach { File(it.filePath).delete() }
+            // content:// (Downloads, a custom folder) and file paths alike.
+            localRecordingDao.allOnceIn(profileId).forEach { com.aeriotv.android.core.data.LocalRecordingFiles.delete(context, it.filePath) }
             localRecordingDao.deleteScope(profileId)
         }
         runCatching { channelSnapshotDao.deleteForPlaylistKey("${p.playlistId}@$profileId") }
@@ -1570,7 +1587,7 @@ class ProfileManager @Inject constructor(
         appMade: Boolean = false,
     ): Result<Unit> = runCatching {
         if (!bypassPin && pinStore.hasPin(profileId)) {
-            check(switchTickets.remove(profileId)) { "Enter PIN" }
+            check(switchTickets.remove(profileId)) { PinCopy.switchNeedsPin(store.byId(profileId)?.displayName.orEmpty()) }
         }
         if (appMade) {
             val target = store.byId(profileId) ?: error("Profile not found")
@@ -1661,10 +1678,10 @@ class ProfileManager @Inject constructor(
                 // A hold that landed since switchTo looked: never activate it.
                 if (!target.isDefault && unusable(target.id)) throw ProfileSignInHeld()
                 if (target.isDefault) {
-                    ProfileScope.activate(null)
+                    ProfileScope.activate(null, ProfileScope.Why.SWITCH)
                     store.setActiveProfileId(playlistId, null)
                 } else {
-                    ProfileScope.activate(target.toOverlay())
+                    ProfileScope.activate(target.toOverlay(), ProfileScope.Why.SWITCH)
                     store.setActiveProfileId(playlistId, target.id)
                 }
                 tokenStore.clear(playlistId)
@@ -1699,14 +1716,14 @@ class ProfileManager @Inject constructor(
         mutex.withLock {
             tLock = System.currentTimeMillis()
             if (target.isDefault) {
-                val a = authenticate(playlistId, target.id, base, row.username.orEmpty(), row.password, row.apiKey)
+                val a = authenticate(playlistId, target.id, base, row.username.orEmpty(), ownPasswordFor(playlistId, base, row), row.apiKey)
                 path = a.path
                 tAuth = System.currentTimeMillis()
                 // Phase 2b: /users/me/ is the only read that gates the scrim;
                 // apply it to the playlist row (the default profile's home).
                 val me = a.me ?: client.fetchMe(base, a.key)
                 tMe = System.currentTimeMillis()
-                ProfileScope.activate(null)
+                ProfileScope.activate(null, ProfileScope.Why.SWITCH)
                 store.setActiveProfileId(playlistId, null)
                 if (me != null) applyMeToDefaultRow(playlistId, target.id, me, base, a.key)
             } else {
@@ -1725,7 +1742,7 @@ class ProfileManager @Inject constructor(
                 ownSignInRepaired(playlistId, updated.id)
                 followServerRole(updated.id, updated.userLevel)
                 runCatching { tagVerified(playlistId, updated.id) }
-                ProfileScope.activate(updated.toOverlay())
+                ProfileScope.activate(updated.toOverlay(), ProfileScope.Why.SWITCH)
                 store.setActiveProfileId(playlistId, updated.id)
             }
             tokenStore.clear(playlistId)
@@ -1778,7 +1795,7 @@ class ProfileManager @Inject constructor(
             mutex.withLock {
                 if (gen != switchGen.get()) return
                 if (target.isDefault) {
-                    val a = authenticate(playlistId, target.id, base, row.username.orEmpty(), row.password, row.apiKey)
+                    val a = authenticate(playlistId, target.id, base, row.username.orEmpty(), ownPasswordFor(playlistId, base, row), row.apiKey)
                     val me = a.me ?: client.fetchMe(base, a.key)
                     if (gen != switchGen.get()) return
                     if (me != null) {
@@ -1855,6 +1872,30 @@ class ProfileManager @Inject constructor(
     @Volatile var onRouteChange: ((playlistId: String, landed: Boolean) -> Unit)? = null
     private val routeChangeStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    /** A server address change on a playlist starts or lands, as [onRouteChange] sees it. */
+    data class RouteChange(val playlistId: String, val landed: Boolean)
+
+    /**
+     * The same starts and landings as [onRouteChange], for On Demand: a
+     * running catalog sweep walks the address it read when it started, so it
+     * stops when a change starts and starts again once the change lands.
+     * Emitted with tryEmit only, so it is as safe as [onRouteChange] inside
+     * the Drive pull's transaction.
+     */
+    private val _routeChanges = kotlinx.coroutines.flow.MutableSharedFlow<RouteChange>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val routeChanges: kotlinx.coroutines.flow.SharedFlow<RouteChange> = _routeChanges
+
+    /** True from the start of a server address change on [playlistId] until it lands. */
+    fun isRouteChanging(playlistId: String): Boolean = routeChangeStarted.contains(playlistId)
+
+    private fun routeChange(playlistId: String, landed: Boolean) {
+        runCatching { onRouteChange?.invoke(playlistId, landed) }
+        _routeChanges.tryEmit(RouteChange(playlistId, landed))
+    }
+
     /** Playlists whose live profile a hold left for the default one; their screen reloads once the change lands. */
     private val leftLive = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val checks = HashMap<String, kotlinx.coroutines.Job>()
@@ -1926,12 +1967,29 @@ class ProfileManager @Inject constructor(
      * network, no Room, and no lock, so it is safe inside the Drive pull's
      * transaction. True when a profile is held.
      */
-    fun holdSignInsForRouteChange(playlistId: String, oldBase: String?, oldLan: String?, newBase: String?, newLan: String?): Boolean {
+    fun holdSignInsForRouteChange(
+        playlistId: String,
+        oldBase: String?,
+        oldLan: String?,
+        newBase: String?,
+        newLan: String?,
+        /** Dispatcharr only: Xtream Codes and M3U sign-ins are part of their URLs (Apple parity). */
+        dispatcharr: Boolean = true,
+    ): Boolean {
         if (!ProfileHostHold.routeChanged(oldBase, newBase, oldLan, newLan)) return false
+        // The playlist's own stored secrets wait for proof too, profiles or not (StoredSecrets).
+        if (dispatcharr) {
+            val was = hostHolds.isRouteUnproven(playlistId)
+            if (hostHolds.markRouteChange(playlistId, ProfileHostHold.routes(oldBase, oldLan), ProfileHostHold.routes(newBase, newLan))) {
+                Log.i(TAG, "[PROFILE-HOST] route unproven playlist=${playlistId.take(8)}: no saved password or stored sign-in goes there until it is proven")
+            } else if (was) {
+                routeProven(playlistId, "back on addresses it used before")
+            }
+        }
         // Dispatcharr Sync drops its saved copy of the old server's record for
         // every profile here, whether or not any profile is held (item 6).
         routeChangeStarted += playlistId
-        runCatching { onRouteChange?.invoke(playlistId, false) }
+        routeChange(playlistId, landed = false)
         val ids = ProfileHostHold.toHold(store.forPlaylist(playlistId))
         if (ids.isEmpty() && hostHolds.hold(playlistId) == null) return false
         return placeHold(playlistId, ids, ProfileHostHold.routes(oldBase, oldLan), hostHolds.recorded(playlistId), ProfileHostHold.routes(newBase, newLan))
@@ -2001,7 +2059,7 @@ class ProfileManager @Inject constructor(
         } else if (activeId != null && hostHolds.isHeld(activeId)) {
             store.setActiveProfileId(playlistId, null)
             if (live) {
-                ProfileScope.activate(null)
+                ProfileScope.activate(null, ProfileScope.Why.HELD)
                 tokenStore.clear(playlistId)
                 CapabilityCorrections.clear(playlistId)
                 closePlayer.trySend(Unit)
@@ -2021,11 +2079,69 @@ class ProfileManager @Inject constructor(
      * default one. Then the same-server check runs.
      */
     fun routeChangeSettled(playlistId: String, reloadUi: Boolean) {
-        if (routeChangeStarted.remove(playlistId)) runCatching { onRouteChange?.invoke(playlistId, true) }
+        if (routeChangeStarted.remove(playlistId)) routeChange(playlistId, landed = true)
         if (leftLive.remove(playlistId) && reloadUi) {
             scope.launch { reloads.send(Reload(playlistId, switchGen.get(), fromSwitch = false)) }
         }
-        if (hostHolds.hold(playlistId) != null) scheduleSameServerCheck(playlistId)
+        if (hostHolds.hold(playlistId) != null || hostHolds.isRouteUnproven(playlistId)) scheduleSameServerCheck(playlistId)
+    }
+
+    // ---- the playlist's own stored secrets (StoredSecrets) ----
+
+    /** Dispatcharr Sync hook: [playlistId]'s route was proven, so a session may start there. */
+    @Volatile var onRouteProven: ((playlistId: String) -> Unit)? = null
+
+    fun isRouteUnproven(playlistId: String): Boolean = hostHolds.isRouteUnproven(playlistId)
+
+    private fun routeProven(playlistId: String, why: String) {
+        Log.i(TAG, "[PROFILE-HOST] route proven playlist=${playlistId.take(8)} ($why)")
+        // The key held because another account answered at the unproven
+        // address is the playlist's again, and so is its prompt's place.
+        if (heldForRoute.remove(playlistId)) {
+            com.aeriotv.android.core.network.DispatcharrRequestGate.clearPlaylist(playlistId)
+            Log.i(TAG, "[PROFILE-HOST] playlist=${playlistId.take(8)}: its key, held for the unproven address, is released")
+        }
+        runCatching { onRouteProven?.invoke(playlistId) }
+    }
+
+    /** Playlists whose own key this manager held for an unproven address (released once it is proven). */
+    private val heldForRoute = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * The user signed [playlistId] in with what they typed: an Edit Playlist
+     * save with a typed password or key proves every address that save set
+     * ([at] null); the rejected-key prompt's sign-in proves only the address
+     * it signed in at ([at]).
+     */
+    fun noteTypedSignIn(playlistId: String, at: String? = null) {
+        val route = at?.let { ProfileHostHold.routeKey(it) }?.takeIf { it.isNotEmpty() }
+        if (hostHolds.markRouteProven(playlistId, route)) routeProven(playlistId, "signed in with typed credentials")
+    }
+
+    /**
+     * Another account answered at [playlistId]'s unproven address with the
+     * playlist's own key: the key is held, so nothing more goes there with
+     * it, the default profile shows the sign-in form, and that account's
+     * permissions are not applied. No automatic re-check (it would only send
+     * the key there again). True when it is held.
+     */
+    private suspend fun holdOwnKeyAtUnprovenRoute(playlistId: String, reason: String): Boolean {
+        if (!StoredSecrets.holdsPlaylistKey(reason, hostHolds.isRouteUnproven(playlistId))) return false
+        return holdOwnKeyForUnprovenRoute(playlistId)
+    }
+
+    /** [holdOwnKeyAtUnprovenRoute] without the verdict: the identity repair, refused at an unproven address, holds it too. */
+    suspend fun holdOwnKeyForUnprovenRoute(playlistId: String): Boolean {
+        val row = playlistDao.rawById(playlistId) ?: return false
+        val key = row.apiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        heldForRoute += playlistId
+        if (com.aeriotv.android.core.network.DispatcharrRequestGate.markKeyRejected(
+                playlistId, key, playlistName = row.name,
+            )
+        ) {
+            Log.i(TAG, "[PROFILE-HOST] playlist=${playlistId.take(8)}: another account answers at the new address; its key is held (sign-in form)")
+        }
+        return true
     }
 
     /**
@@ -2036,24 +2152,30 @@ class ProfileManager @Inject constructor(
      * address still unproven. [key] must be the playlist's own key; another
      * profile's answer is ignored.
      */
-    suspend fun noteDefaultMe(playlistId: String, base: String, key: String, userId: Int, username: String) {
-        val row = playlistDao.rawById(playlistId) ?: return
-        val own = row.apiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return
-        if (own != key.trim()) return
+    suspend fun noteDefaultMe(playlistId: String, base: String, key: String, userId: Int, username: String): Boolean {
+        val row = playlistDao.rawById(playlistId) ?: return false
+        val own = row.apiKey?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        if (own != key.trim()) return false
         val current = ProfileHostHold.routes(row.urlString, row.lanUrlString)
         val identity = ProfileHostHold.Identity(userId, username.trim())
+        val wasUnproven = hostHolds.isRouteUnproven(playlistId)
         when (val o = hostHolds.onAnswer(playlistId, ProfileHostHold.routeKey(base), current, ProfileHostHold.Answer.Me(identity))) {
-            is HostHoldBook.Outcome.Failed ->
+            is HostHoldBook.Outcome.Failed -> {
                 Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=${o.reason} playlist=${playlistId.take(8)}")
+                return holdOwnKeyAtUnprovenRoute(playlistId, o.reason)
+            }
             // Profiles from before tags existed belong to the server this record came from.
             HostHoldBook.Outcome.Recorded ->
                 hostHolds.tagUntagged(store.forPlaylist(playlistId).filterNot { it.isDefault }.map { it.id }, identity)
             HostHoldBook.Outcome.Proven -> {
                 Log.i(TAG, "[PROFILE-HOST] same-server check passed reason=same-user playlist=${playlistId.take(8)}")
+                if (wasUnproven && !hostHolds.isRouteUnproven(playlistId)) routeProven(playlistId, "same server")
                 scheduleSameServerCheck(playlistId)
             }
-            HostHoldBook.Outcome.Ignored -> if (hostHolds.hold(playlistId) != null) scheduleSameServerCheck(playlistId)
+            HostHoldBook.Outcome.Ignored ->
+                if (hostHolds.hold(playlistId) != null || hostHolds.isRouteUnproven(playlistId)) scheduleSameServerCheck(playlistId)
         }
+        return false
     }
 
     /**
@@ -2096,18 +2218,22 @@ class ProfileManager @Inject constructor(
      * the hold lifts. Anything else keeps it.
      */
     private suspend fun sameServerCheck(playlistId: String) {
-        val rec = hostHolds.hold(playlistId) ?: return
+        val rec = hostHolds.hold(playlistId)
+        if (rec == null && !hostHolds.isRouteUnproven(playlistId)) return
         val row = playlistDao.rawById(playlistId) ?: return
+        val current = ProfileHostHold.routes(row.urlString, row.lanUrlString)
+        // The playlist's own route: a failed save put the row back, or a move back onto trusted addresses.
+        if (hostHolds.isRouteUnproven(playlistId) && !hostHolds.settleRoutes(playlistId, current)) routeProven(playlistId, "back on addresses it used before")
+        val proof = hostHolds.routeProof(playlistId)
         // The snapshot taken before the change; with none it is not the same server.
-        if (rec.expected() == null) {
+        if ((rec?.expected() ?: hostHolds.recorded(playlistId)) == null) {
             Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=no-record playlist=${playlistId.take(8)}")
             return
         }
-        val current = ProfileHostHold.routes(row.urlString, row.lanUrlString)
-        val unproven = ProfileHostHold.unproven(current, rec.trusted)
+        val unproven = rec?.let { ProfileHostHold.unproven(current, it.trusted) }.orEmpty() + proof?.unproven.orEmpty()
         if (unproven.isEmpty()) {
             // Every address in use is proven: an earlier answer matched, or it is one the snapshot came from (a failed save, or a move back).
-            liftHeld(playlistId, current, "proven")
+            if (rec != null) liftHeld(playlistId, current, "proven")
             return
         }
         val key = row.apiKey?.takeIf { it.isNotBlank() }
@@ -2119,17 +2245,21 @@ class ProfileManager @Inject constructor(
                 DispatcharrClient.MeCheck.Rejected -> ProfileHostHold.Answer.Rejected
                 DispatcharrClient.MeCheck.Unreachable -> ProfileHostHold.Answer.Unreachable
             }
+            val wasUnproven = hostHolds.isRouteUnproven(playlistId)
             when (val o = hostHolds.onAnswer(playlistId, ProfileHostHold.routeKey(url), current, answer)) {
                 is HostHoldBook.Outcome.Failed -> {
                     Log.i(TAG, "[PROFILE-HOST] same-server check failed reason=${o.reason} playlist=${playlistId.take(8)}")
+                    holdOwnKeyAtUnprovenRoute(playlistId, o.reason)
                     return
                 }
-                HostHoldBook.Outcome.Proven ->
+                HostHoldBook.Outcome.Proven -> {
                     Log.i(TAG, "[PROFILE-HOST] same-server check passed reason=same-user playlist=${playlistId.take(8)}")
+                    if (wasUnproven && !hostHolds.isRouteUnproven(playlistId)) routeProven(playlistId, "same server")
+                }
                 else -> Unit
             }
         }
-        liftHeld(playlistId, current, "same-user")
+        if (rec != null) liftHeld(playlistId, current, "same-user")
     }
 
     /** Lifts the held profiles whose tag is the snapshot; the rest stay held and ask to sign in. */
@@ -2147,6 +2277,38 @@ class ProfileManager @Inject constructor(
         heldChanged()
         Log.i(TAG, "[PROFILE-HOST] lifted playlist=${pid.take(8)} profiles=1 reason=$reason")
     }
+
+    /**
+     * The playlist was deleted on this device (playlist delete cutoff): its
+     * profiles and their stored sign-ins go, with their PINs and sign-in
+     * tags. Nothing is sent anywhere: no roster tombstone, so the server's
+     * roster and other devices keep these users. Their reminders and
+     * recordings are not touched here (the delete decides those). Returns
+     * the removed sign-ins' API keys, for the request gate.
+     */
+    fun forgetPlaylistProfiles(playlistId: String): List<String> {
+        val gone = store.forPlaylist(playlistId)
+        val keys = gone.mapNotNull { it.apiKey?.trim()?.takeIf { k -> k.isNotEmpty() } }
+        gone.filterNot { it.isDefault }.forEach { p ->
+            runCatching { pinStore.remove(p.id) }
+            runCatching { snapshotStamps.remove("$playlistId@${p.id}") }
+            rosterAdds.forget(p.id)
+            hostHolds.tag(p.id, null)
+            hostHolds.clearPausedAdd(p.id)
+        }
+        if (ProfileScope.activeOverlay()?.playlistId == playlistId) ProfileScope.activate(null, ProfileScope.Why.PLAYLIST)
+        store.removeForPlaylist(playlistId)
+        heldForRoute.remove(playlistId)
+        heldChanged()
+        Log.i(TAG, "[PROFILE] playlist ${playlistId.take(8)} deleted: ${gone.size} profile(s) and their sign-ins removed from this device")
+        return keys
+    }
+
+    /** True when a profile here still signs in with [key]. */
+    fun usesKey(key: String): Boolean = store.profiles.value.any { it.apiKey?.trim() == key.trim() }
+
+    /** Close any player route left open (the playlist it plays from was deleted). */
+    fun requestClosePlayer() { closePlayer.trySend(Unit) }
 
     /**
      * The playlist was deleted: its recorded identity and its hold go. Held
@@ -2195,7 +2357,8 @@ class ProfileManager @Inject constructor(
         val base = repository.effectiveBaseUrl(row)
         val jwt = client.login(base, username.trim(), password, childSealBypass = true)
         val key = client.fetchCurrentUserApiKey(base, jwt.access, childSealBypass = true)
-        val me = client.fetchMe(base, key, childSealBypass = true) ?: throw DispatcharrError.Transport("Could not read the account.")
+        // The key the sign-in was just issued is checked as it is (never swapped, past the held-key gate).
+        val me = client.fetchMe(base, key, childSealBypass = true, keyCheck = true) ?: throw DispatcharrError.Transport("Could not read the account.")
         // Another account's sign-in never becomes this profile's.
         if (!ProfileHostHold.isOwnUser(p.username, me.username)) throw DispatcharrError.InvalidCredentials("Signed in as another user.")
         store.update(profileId) { it.copy(password = password).applyMe(me, key) }
@@ -2229,7 +2392,8 @@ class ProfileManager @Inject constructor(
         val base = repository.effectiveBaseUrl(row)
         val jwt = client.login(base, username.trim(), password)
         val key = client.fetchCurrentUserApiKey(base, jwt.access)
-        val me = client.fetchMe(base, key) ?: throw DispatcharrError.Transport("Could not read the account.")
+        // The key the sign-in was just issued is checked as it is (never swapped, past the held-key gate).
+        val me = client.fetchMe(base, key, keyCheck = true) ?: throw DispatcharrError.Transport("Could not read the account.")
         if (!ProfileHostHold.isOwnUser(p.username, me.username)) throw DispatcharrError.InvalidCredentials("Signed in as another user.")
         val oldKey = p.apiKey?.trim()?.takeIf { it.isNotEmpty() }
         store.update(profileId) { it.copy(password = password).applyMe(me, key) }
@@ -2268,6 +2432,16 @@ class ProfileManager @Inject constructor(
     }
 
     private data class Auth(val key: String, val me: MeResponse?, val path: String)
+
+    /**
+     * The playlist's saved password for the default profile's sign-in at
+     * [base], or null where it may not go (StoredSecrets: an address not
+     * proven the same server). Its own key is still tried there.
+     */
+    private fun ownPasswordFor(playlistId: String, base: String, row: PlaylistEntity): String? {
+        val p = row.password?.takeIf { it.isNotBlank() } ?: return null
+        return p.takeIf { StoredSecrets.check(playlistId, base, StoredSecrets.Path.SilentRelogin) }
+    }
 
     /**
      * Sign in as one user; returns that user's API key. Fast switch: a stored
@@ -2309,7 +2483,17 @@ class ProfileManager @Inject constructor(
             val key = DispatcharrLoginGate.silentRelogin("$playlistId:$profileId") {
                 try {
                     val pair = client.login(base, username, password)
-                    client.fetchCurrentUserApiKey(base, pair.access)
+                    val minted = client.fetchCurrentUserApiKey(base, pair.access)
+                    // One request checks the key before it is stored or sent
+                    // (2026-11-12, Apple 44c544c): a refused one ends the
+                    // re-login with no key and parks this profile's slot.
+                    val proof = client.probeApiKeyOnce(base, minted)
+                    com.aeriotv.android.core.network.reloginOutcome(minted, proof).also {
+                        if (proof is com.aeriotv.android.core.network.DispatcharrClient.KeyProbe.Accepted) {
+                            com.aeriotv.android.core.network.DispatcharrRequestGate.clearKey(it)
+                            DispatcharrLoginGate.noteKeyVerified("$playlistId:$profileId", it)
+                        }
+                    }
                 } catch (e: DispatcharrError.InvalidCredentials) {
                     throw e
                 } catch (e: DispatcharrError) {

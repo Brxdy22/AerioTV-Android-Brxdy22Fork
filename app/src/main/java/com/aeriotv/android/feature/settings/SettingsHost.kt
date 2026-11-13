@@ -68,10 +68,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.aeriotv.android.ui.settings.LocalSettingsInPane
 import com.aeriotv.android.ui.settings.SettingsNavRow
 import com.aeriotv.android.ui.settings.SettingsSectionHeader
 import com.aeriotv.android.ui.settings.TvSettingsMetrics
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.material.icons.filled.ManageAccounts
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.SettingsRemote
+import androidx.compose.material.icons.filled.ToggleOn
+import androidx.compose.material.icons.filled.Brush
+import androidx.compose.material.icons.filled.LocalMovies
+import androidx.compose.material.icons.filled.SmartDisplay
+import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.Layers
+import androidx.compose.ui.layout.positionInWindow
 
 /**
  * Fallback touch sidebar width (plan B3) for callers that do not pass one.
@@ -318,7 +333,7 @@ private fun SettingsSidebar(
                 Spacer(Modifier.height(10.dp))
                 SettingsNavRow(
                     title = "Manage Profiles",
-                    subtitle = "Switch profiles, Admin PIN",
+                    subtitle = com.aeriotv.android.core.profiles.PinCopy.MANAGE_PROFILES_ROW,
                     icon = androidx.compose.material.icons.Icons.Outlined.ManageAccounts,
                     onClick = { onSelect(SettingsRoute.ManageProfiles) },
                     selected = selection is SettingsRoute.ManageProfiles,
@@ -531,7 +546,7 @@ fun SettingsTvRailHost(
             },
             railFocus = railFocus,
             modifier = Modifier
-                .width(TvRailWidth + TvOverscanStart)
+                .width(TvSettingsMetrics.railColumnWidth)
                 .onFocusChanged { railHasFocus = it.hasFocus }
                 .onPreviewKeyEvent { event ->
                     val right = event.key == Key.DirectionRight &&
@@ -568,6 +583,8 @@ fun SettingsTvRailHost(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight()
+                // Apple TV's detail column (TvSettingsMetrics.paneInset*).
+                .padding(start = TvSettingsMetrics.paneInsetStart, top = TvSettingsMetrics.paneInsetTop, end = TvSettingsMetrics.paneInsetEnd)
                 .focusRequester(detailFocus)
                 .onFocusChanged { detailHasFocus = it.hasFocus }
                 // Left out of any page lands on the SELECTED rail row (the
@@ -649,7 +666,7 @@ private fun SettingsTvRail(
                     )
                 }
             }
-            if (railChild) add(Triple(SettingsRoute.ManageProfiles as SettingsRoute, "Manage Profiles", "Switch profiles, Admin PIN"))
+            if (railChild) add(Triple(SettingsRoute.ManageProfiles as SettingsRoute, "Manage Profiles", com.aeriotv.android.core.profiles.PinCopy.MANAGE_PROFILES_ROW))
         }
     }
     val selectedIndex = rows.indexOfFirst { it.first == selection }.coerceAtLeast(0)
@@ -677,25 +694,33 @@ private fun SettingsTvRail(
     val windowFocused = androidx.compose.runtime.rememberUpdatedState(
         androidx.compose.ui.platform.LocalWindowInfo.current.isWindowFocused,
     )
+    // Apple TV's rail geometry (08c1be8, TvSettingsMetrics): the first row's
+    // top rests at y 98.5 dp on screen, level with the detail card's top,
+    // and 12 rows fit above the bottom safe edge, so the rail never scrolls
+    // at the default text size. The column's top is measured on screen; the
+    // offset to the resting top sits OUTSIDE the list, so a rail that does
+    // scroll (a large system font scale) clips there, never in the tab bar's
+    // band, with 1 dp inside the clip for the focus ring.
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    var columnTopDp by remember { mutableStateOf<Float?>(null) }
+    val restingOffset = columnTopDp?.let {
+        (TvSettingsMetrics.railRestingTop.value - it - TvSettingsMetrics.railRingRoom.value).coerceAtLeast(0f).dp
+    } ?: 0.dp
     LazyColumn(
         state = listState,
-        modifier = modifier.fillMaxHeight(),
-        // Top inset aligns the first rail row with the DETAIL PANE'S TITLE.
-        // At 8dp the rail started ~20dp above it and read as floating higher
-        // than the body it belongs to (Logan, on the Streamer). tvOS lines its
-        // rail up with the pane content for the same reason.
-        //
-        // Still budgeted so ALL rail items clear the fold: tvOS fits its 9
-        // without scrolling, Android carries 11 (Remote Control is TV-only,
-        // App Updates sideload-only), so the pitch stays near 40dp and the
-        // inset can only spend what the budget leaves.
+        modifier = modifier
+            .fillMaxHeight()
+            .onGloballyPositioned { c ->
+                if (columnTopDp == null) columnTopDp = with(density) { c.positionInWindow().y.toDp().value }
+            }
+            .padding(top = restingOffset),
         contentPadding = PaddingValues(
-            start = TvOverscanStart,
-            end = 12.dp,
-            top = 30.dp,
-            bottom = 12.dp,
+            start = TvSettingsMetrics.railRowStart,
+            end = TvSettingsMetrics.railTrailing,
+            top = TvSettingsMetrics.railRingRoom,
+            bottom = TvSettingsMetrics.railRingRoom,
         ),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+        verticalArrangement = Arrangement.spacedBy(TvSettingsMetrics.railRowGap),
     ) {
         itemsIndexed(rows, key = { _, row -> encodeSettingsRoute(row.first) }) { index, row ->
             val (route, title, subtitle) = row
@@ -707,17 +732,20 @@ private fun SettingsTvRail(
             SettingsNavRow(
                 title = title,
                 subtitle = subtitle,
-                icon = settingsRouteIcon(route),
-                // tvOS draws DVR as a red record.circle, not an accent glyph.
-                iconTint = if (route == SettingsRoute.Section(SettingsSection.DvrSettings)) {
-                    TvDvrRecordRed
-                } else {
-                    null
+                icon = tvRailIcon(route),
+                railIconGlyph = tvRailIconBox(route),
+                // tvOS tints: DVR's record.circle red, Developer's ladybug the
+                // secondary accent, every other glyph the accent.
+                iconTint = when (route) {
+                    SettingsRoute.Section(SettingsSection.DvrSettings) -> TvDvrRecordRed
+                    SettingsRoute.Section(SettingsSection.Developer) -> MaterialTheme.colorScheme.secondary
+                    else -> null
                 },
                 onClick = { onClickRoute(route) },
                 selected = route == selection,
                 trailingChevron = false,
                 flat = true,
+                railMinHeight = TvSettingsMetrics.railRowHeight,
                 modifier = Modifier
                     .onFocusChanged {
                         if (it.isFocused && !wasFocused) {
@@ -745,6 +773,51 @@ private fun SettingsTvRail(
             )
         }
     }
+}
+
+/**
+ * The Apple TV rail's filled SF Symbols, as Material equivalents
+ * (SettingsView.swift allTVRailItems): rectangle.stack.fill, tv.fill,
+ * play.rectangle.fill, film.fill, record.circle, paintbrush.fill, switch.2,
+ * av.remote, icloud.fill, ladybug.fill, info.circle.fill.
+ */
+private fun tvRailIcon(route: SettingsRoute): androidx.compose.ui.graphics.vector.ImageVector = when (route) {
+    SettingsRoute.Playlists -> Icons.Filled.Layers
+    SettingsRoute.Section(SettingsSection.LiveTV) -> Icons.Filled.Tv
+    SettingsRoute.Section(SettingsSection.Player) -> Icons.Filled.SmartDisplay
+    SettingsRoute.Section(SettingsSection.MoviesAndTvShows) -> Icons.Filled.LocalMovies
+    SettingsRoute.Section(SettingsSection.DvrSettings) -> Icons.Outlined.RadioButtonChecked
+    SettingsRoute.Section(SettingsSection.Appearance) -> Icons.Filled.Brush
+    SettingsRoute.Section(SettingsSection.General) -> Icons.Filled.ToggleOn
+    SettingsRoute.Section(SettingsSection.RemoteControl) -> Icons.Filled.SettingsRemote
+    SettingsRoute.Section(SettingsSection.Sync) -> Icons.Filled.Cloud
+    SettingsRoute.Section(SettingsSection.AppUpdates) -> Icons.Filled.SystemUpdate
+    SettingsRoute.Section(SettingsSection.Developer) -> Icons.Filled.BugReport
+    SettingsRoute.Section(SettingsSection.About), SettingsRoute.About -> Icons.Filled.Info
+    SettingsRoute.ManageProfiles -> Icons.Filled.ManageAccounts
+    else -> settingsRouteIcon(route)
+}
+
+/**
+ * Each rail glyph's box, so the drawn glyph is Apple TV's size (measured on
+ * the Apple TV, settings-compare/atv4, 2026-11-13: tv.fill 15 dp wide,
+ * film.fill 14, info.circle.fill 12.2 across...). Material icons pad their
+ * glyphs differently, so one box size drew them about two-thirds as large
+ * on the Streamer; each box here scales its glyph's larger side to Apple's.
+ */
+private fun tvRailIconBox(route: SettingsRoute): androidx.compose.ui.unit.TextUnit = when (route) {
+    SettingsRoute.Playlists -> 17.7.sp
+    SettingsRoute.Section(SettingsSection.LiveTV) -> 16.0.sp
+    SettingsRoute.Section(SettingsSection.Player) -> 17.5.sp
+    SettingsRoute.Section(SettingsSection.MoviesAndTvShows) -> 19.2.sp
+    SettingsRoute.Section(SettingsSection.DvrSettings) -> 15.3.sp
+    SettingsRoute.Section(SettingsSection.Appearance) -> 18.6.sp
+    SettingsRoute.Section(SettingsSection.General) -> 14.4.sp
+    SettingsRoute.Section(SettingsSection.RemoteControl) -> 14.6.sp
+    SettingsRoute.Section(SettingsSection.Sync) -> 14.9.sp
+    SettingsRoute.Section(SettingsSection.Developer) -> 19.2.sp
+    SettingsRoute.Section(SettingsSection.About), SettingsRoute.About -> 15.3.sp
+    else -> 16.0.sp
 }
 
 /** The system red Apple uses for the tvOS DVR rail glyph (UIColor.systemRed, dark). */

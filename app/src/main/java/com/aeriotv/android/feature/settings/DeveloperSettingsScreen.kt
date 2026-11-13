@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import com.aeriotv.android.ui.scale.subtext
 import android.content.Intent
 import androidx.compose.foundation.background
@@ -33,7 +34,6 @@ import androidx.compose.material.icons.outlined.NetworkCheck
 import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.WarningAmber
-import com.aeriotv.android.ui.scale.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -64,7 +64,6 @@ import com.aeriotv.android.BuildConfig
 import com.aeriotv.android.core.debug.DebugLogger
 import com.aeriotv.android.ui.settings.settingsFormWidth
 import com.aeriotv.android.ui.settings.SettingsDetailTopBar
-import com.aeriotv.android.ui.settings.SettingsDialogTextButton
 import com.aeriotv.android.ui.settings.SettingsPickerOption
 import com.aeriotv.android.ui.settings.SettingsPickerRow
 import com.aeriotv.android.ui.settings.SettingsSubPageHost
@@ -147,12 +146,14 @@ fun DeveloperSettingsScreen(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = androidx.compose.ui.Alignment.TopCenter,
         ) {
+        val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
         LazyColumn(
+            state = paneList,
             // Phase B1 bug fix: this was the only settings screen missing the
             // readable-width cap, so on a tablet or TV its rows stretched the
             // full window while every sibling screen capped. Matches the
             // Network/DVR/Playlist pattern.
-            modifier = Modifier.settingsFormWidth().fillMaxSize(),
+            modifier = Modifier.settingsFormWidth().fillMaxSize().settingsPaneTopEdge(paneList),
             // 104dp bottom clears the MainScaffold NavigationBar so the
             // Build section (version code, "What's Captured" list) isn't
             // clipped.
@@ -162,7 +163,7 @@ fun DeveloperSettingsScreen(
                 top = 12.dp,
                 bottom = LocalTabBarBottomInset.current,
             ),
-            verticalArrangement = Arrangement.spacedBy(20.dp),
+            verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
         ) {
             item("logging") {
                 LoggingSection(
@@ -171,17 +172,20 @@ fun DeveloperSettingsScreen(
                     onRequestDisable = { pendingDisable = true },
                 )
             }
-            // Force HLS (Dispatcharr native HLS test), TV, phone and tablet.
-            item("force-hls") {
+            // Section order follows Apple per platform. Phone: Logging, What's
+            // Captured, Force HLS, Cast, Log File. TV: Logging, Force HLS, Log
+            // File, What's Captured, and no Cast section at all (casting is a
+            // phone-sender feature). Force HLS sits where Apple's Playback
+            // Engine section does: after What's Captured on iOS, after Logging
+            // on tvOS; Android has no engine choice yet.
+            if (isTv) item("force-hls") {
                 ForceHlsSection(checked = forceHls, onCheckedChange = settingsVm::setDeveloperForceHls)
             }
-            // Section order follows Apple per platform. Phone: Logging, What's
-            // Captured, Cast, Log File. TV: Logging, Log File, What's Captured,
-            // and no Cast section at all (casting is a phone-sender feature).
-            // Apple's Playback Engine section sits after What's Captured on
-            // iOS and after Logging on tvOS; Android has no engine choice yet.
             if (!isTv) {
                 item("captured") { WhatsCapturedSection() }
+                item("force-hls") {
+                    ForceHlsSection(checked = forceHls, onCheckedChange = settingsVm::setDeveloperForceHls)
+                }
                 item("cast") {
                     CastTestSection(
                         forceTranscode = castForceHevc,
@@ -217,79 +221,52 @@ fun DeveloperSettingsScreen(
     }
 
     if (pendingEnable) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingEnable = false },
-            title = { Text("Enable Debug Logging?") },
-            text = {
-                Text(
-                    "AerioTV will write detailed diagnostic logs to a file in the app's " +
-                        "private storage.\n\nLogs include network requests, playback events, " +
-                        "and error details. They never leave the device unless you share the " +
-                        "file from this screen.\n\nLogging has a minor impact on performance " +
-                        "and storage. You can disable it at any time.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Enable Logging",
-                    onClick = {
-                        pendingEnable = false
-                        settingsVm.setDebugLoggingEnabled(true)
-                    },
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { pendingEnable = false })
-            },
+            title = "Enable Debug Logging?",
+            message = "AerioTV will write detailed diagnostic logs to a file in the app's " +
+                "private storage.\n\nLogs include network requests, playback events, " +
+                "and error details. They never leave the device unless you share the " +
+                "file from this screen.\n\nLogging has a minor impact on performance " +
+                "and storage. You can disable it at any time.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Enable Logging") {
+                    pendingEnable = false
+                    settingsVm.setDebugLoggingEnabled(true)
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingEnable = false },
+            ),
         )
     }
 
     if (pendingDisable) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingDisable = false },
-            title = { Text("Disable Debug Logging?") },
-            text = {
-                Text("The existing log file will be kept. You can share or clear it at any time.")
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Disable",
-                    onClick = {
-                        pendingDisable = false
-                        settingsVm.setDebugLoggingEnabled(false)
-                    },
-                    destructive = true,
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Keep Logging", onClick = { pendingDisable = false })
-            },
+            title = "Disable Debug Logging?",
+            message = "The existing log file will be kept. You can share or clear it at any time.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Disable", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    pendingDisable = false
+                    settingsVm.setDebugLoggingEnabled(false)
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Keep Logging", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingDisable = false },
+            ),
         )
     }
 
     if (pendingClear) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingClear = false },
-            title = { Text("Delete All Logs?") },
-            text = {
-                Text(
-                    "This permanently deletes the current log and any rotated " +
-                        "archives. This cannot be undone.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Delete All Logs",
-                    onClick = {
-                        pendingClear = false
-                        debugLogger.deleteAllLogs()
-                    },
-                    destructive = true,
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { pendingClear = false })
-            },
+            title = "Delete All Logs?",
+            message = "This permanently deletes the current log and any rotated " +
+                "archives. This cannot be undone.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Delete All Logs", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    pendingClear = false
+                    debugLogger.deleteAllLogs()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingClear = false },
+            ),
         )
     }
 
@@ -634,17 +611,17 @@ private fun DevToggleRow(
         // Apple TV keeps the Debug Logging tile in the accent at full size
         // in both states; the phone dims it while off.
         DevIconTile(icon = icon, isActive = checked || rememberIsTvDevice())
-        Spacer(Modifier.size(14.dp))
+        Spacer(Modifier.size(com.aeriotv.android.ui.settings.settingsTileGap()))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = title,
                 style = settingsRowTitleStyle(),
                 color = MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.Medium,
+                fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             )
             Text(
                 text = subtitle,
-                style = settingsFootnoteStyle(),
+                style = com.aeriotv.android.ui.settings.settingsRowSubtitleOrFootnote(),
                 color = if (checked) MaterialTheme.colorScheme.textAccent
                 else MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -666,19 +643,19 @@ private fun DevActionRow(
     val tint = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
     SettingsRowContainer(onClick = onClick) {
         DevIconTile(icon = icon, tint = tint)
-        Spacer(Modifier.size(14.dp))
+        Spacer(Modifier.size(com.aeriotv.android.ui.settings.settingsTileGap()))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = label,
                 style = settingsRowTitleStyle(),
                 color = if (destructive) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.Medium,
+                fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             )
             if (subtitle != null) {
                 Text(
                     text = subtitle,
-                    style = settingsFootnoteStyle().subtext(),
+                    style = com.aeriotv.android.ui.settings.settingsRowSubtitleOrFootnote().subtext(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -692,19 +669,19 @@ private fun DevLogSizeRow(sizeText: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 52.dp)
+            .heightIn(min = if (rememberIsTvDevice()) com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowMinHeight else 52.dp)
             .settingsRowCard(focused = false)
             .settingsTvFocusableRow()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = if (rememberIsTvDevice()) com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowPaddingV else 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         DevIconTile(icon = Icons.Outlined.Description, isActive = false)
-        Spacer(Modifier.size(14.dp))
+        Spacer(Modifier.size(com.aeriotv.android.ui.settings.settingsTileGap()))
         Text(
             text = "Log File Size",
             style = settingsRowTitleStyle(),
             color = MaterialTheme.colorScheme.onBackground,
-            fontWeight = FontWeight.Medium,
+            fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             modifier = Modifier.weight(1f),
         )
         Text(

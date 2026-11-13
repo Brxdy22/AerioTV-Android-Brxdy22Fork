@@ -42,6 +42,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -61,6 +63,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aeriotv.android.core.profiles.DispatcharrProfile
+import com.aeriotv.android.core.profiles.PinCopy
 import com.aeriotv.android.core.profiles.PinDirection
 import com.aeriotv.android.core.profiles.PinRules
 import com.aeriotv.android.core.profiles.PinType
@@ -98,7 +101,7 @@ fun PinEntryDialog(
     lockSeconds: (() -> Int)? = null,
     /** Start focus on Clear instead of "1" (a step that follows another pad). */
     focusClear: Boolean = false,
-    /** Entering an existing PIN: its stored length (null = unknown, 6 dots). */
+    /** Entering an existing PIN: its stored length (null = unknown: a dot per digit typed). */
     pinLength: Int? = null,
     /** Setting a new PIN: 4 dots that grow to 6 as digits are typed. */
     setting: Boolean = false,
@@ -165,6 +168,14 @@ fun PinEntryDialog(
             Modifier
                 .fillMaxSize()
                 .background(Color.Black.copy(alpha = if (onDismiss == null) 0.92f else 0.6f))
+                // A tap outside the pad is its Cancel (the same handler); a PIN
+                // entry with no Cancel (the launch gate) ignores it. The pad's
+                // Surface takes its own taps.
+                .then(
+                    if (onDismiss != null) Modifier.pointerInput(onDismiss) {
+                        detectTapGestures(onTap = { onDismiss() })
+                    } else Modifier,
+                )
                 .onPreviewKeyEvent { ev ->
                     val down = ev.type == KeyEventType.KeyDown
                     when (ev.key) {
@@ -216,13 +227,10 @@ fun PinEntryDialog(
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     Text(title, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+                    // Unknown length (a synced PIN): dots appear as digits are typed.
                     PinDots(
                         filled = entries.size,
-                        count = when {
-                            fixed != null -> fixed
-                            setting -> entries.size.coerceIn(PinRules.MIN_LENGTH, PinRules.MAX_LENGTH)
-                            else -> PinRules.MAX_LENGTH
-                        },
+                        count = PinRules.dotCount(knownLength = fixed, setting = setting, typed = entries.size),
                     )
                     Text(
                         error.orEmpty(),
@@ -276,7 +284,8 @@ fun PinEntryDialog(
 
 @Composable
 private fun PinDots(filled: Int, count: Int) {
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    // The row keeps its height while empty, so nothing moves on the first digit.
+    Row(Modifier.height(14.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         repeat(count) { i ->
             val on = i < filled
             Box(
@@ -419,11 +428,12 @@ fun SetPinFlow(
     var type by remember { mutableStateOf<PinType?>(null) }
     var first by remember { mutableStateOf<List<String>?>(null) }
     var mismatch by remember { mutableStateOf<String?>(null) }
-    val title = if (vm.hasPin(profile.id) && onChosen == null) "Change PIN" else "Set PIN"
+    val name = profile.displayName
+    val title = if (vm.hasPin(profile.id) && onChosen == null) PinCopy.changePin(name) else PinCopy.setPin(name)
 
     when {
         nc && current == null -> PinEntryDialog(
-            title = "Enter PIN",
+            title = PinCopy.currentPin(name),
             type = vm.pinType(profile.id) ?: PinType.Numbers,
             pinLength = vm.pinLength(profile.id),
             onDismiss = { onClose(null) },
@@ -433,9 +443,9 @@ fun SetPinFlow(
             },
             lockSeconds = { vm.pinLockSeconds(profile.id) },
         )
-        type == null -> com.aeriotv.android.ui.settings.SettingsAlertDialog(
+        type == null -> ProfileAlertDialog(
             onDismissRequest = { onClose(null) },
-            title = { Text("PIN type") },
+            title = { Text(PinCopy.pinType(name)) },
             text = {
                 Column {
                     PinType.entries.forEach { t ->
@@ -447,7 +457,7 @@ fun SetPinFlow(
             dismissButton = { SettingsDialogTextButton(label = "Cancel", onClick = { onClose(null) }) },
         )
         first == null -> PinEntryDialog(
-            title = "$title: Enter PIN",
+            title = title,
             type = type!!,
             onDismiss = { onClose(null) },
             initialError = mismatch,
@@ -456,7 +466,7 @@ fun SetPinFlow(
             onEntered = { seq -> first = seq; mismatch = null; null },
         )
         else -> PinEntryDialog(
-            title = "Confirm PIN",
+            title = PinCopy.confirmPin(name),
             type = type!!,
             pinLength = first!!.size,
             focusClear = true,
@@ -489,7 +499,9 @@ fun RemovePinFlow(
 ) {
     val scope = rememberCoroutineScope()
     vm.pinRemovalBlock(playlistId, profile.id)?.let { reason ->
-        com.aeriotv.android.ui.settings.SettingsAlertDialog(
+        ProfileAlertDialog(
+            // OK only: a tap outside does nothing (no Cancel to stand for).
+            outsideTapCancels = false,
             onDismissRequest = { onClose(null) },
             title = { Text("Remove PIN") },
             text = { Text(reason) },
@@ -505,7 +517,7 @@ fun RemovePinFlow(
     }
     if (needsCurrent != true) return
     PinEntryDialog(
-        title = "Remove PIN",
+        title = PinCopy.removePin(profile.displayName),
         type = vm.pinType(profile.id) ?: PinType.Numbers,
         pinLength = vm.pinLength(profile.id),
         onDismiss = { onClose(null) },
@@ -539,8 +551,14 @@ internal fun ChoiceRow(
     modifier: Modifier = Modifier,
     /** One-of-N choice: a radio button instead of a checkbox. */
     radio: Boolean = false,
+    /** A line under the label (a role's description in the Role dialog). */
+    subtitle: String? = null,
 ) {
     var focused by remember { mutableStateOf(false) }
+    // Inside a profile dialog on phones and tablets the row has no inset of
+    // its own, so its text shares the card's one left edge; TV keeps it for
+    // its focus card (owner 2026-11-12, Apple parity).
+    val inset = if (LocalInProfileDialog.current && !com.aeriotv.android.ui.settings.rememberIsTvDevice()) 0.dp else 12.dp
     // D-pad OK fires only on a KeyUp whose KeyDown this row also saw. The
     // release of the long press that opened a row menu arrives as a bare
     // KeyUp (its KeyDown went to the launching row), so it cannot pick the
@@ -569,7 +587,7 @@ internal fun ChoiceRow(
             }
             .settingsRowCard(focused)
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 12.dp),
+            .padding(horizontal = inset, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (checked != null) {
@@ -579,11 +597,16 @@ internal fun ChoiceRow(
             ) else Checkbox(checked = checked, onCheckedChange = null)
             Spacer(Modifier.size(8.dp))
         }
-        Text(
-            label,
-            style = MaterialTheme.typography.bodyLarge,
-            color = when { destructive -> MaterialTheme.colorScheme.error; checked == true -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurface },
-        )
+        androidx.compose.foundation.layout.Column {
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = when { destructive -> MaterialTheme.colorScheme.error; checked == true -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurface },
+            )
+            subtitle?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 
@@ -608,7 +631,7 @@ fun ChannelProfilesDialog(
             { error = it.message ?: "Could not load channel profiles" },
         )
     }
-    com.aeriotv.android.ui.settings.SettingsAlertDialog(
+    ProfileAlertDialog(
         onDismissRequest = { onClose(null) },
         title = { Text("Channel Profiles") },
         text = {

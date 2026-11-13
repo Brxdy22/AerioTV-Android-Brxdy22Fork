@@ -29,7 +29,6 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.Wifi
-import com.aeriotv.android.ui.scale.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -72,7 +71,6 @@ import com.aeriotv.android.core.data.db.entity.isDispatcharrDirectConnect
 import com.aeriotv.android.core.preferences.DispatcharrAccountFacts
 import com.aeriotv.android.feature.playlist.PlaylistViewModel
 import com.aeriotv.android.ui.settings.settingsFormWidth
-import com.aeriotv.android.ui.settings.SettingsDialogTextButton
 import com.aeriotv.android.ui.settings.SettingsHeaderTextButton
 import com.aeriotv.android.ui.settings.rememberIsTvDevice
 import java.text.DateFormat
@@ -299,7 +297,7 @@ fun PlaylistDetailScreen(
                                     Modifier
                                 },
                             )
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
                     ) {
                         DetailRow("Type", playlist.detailTypeLabel())
                         // Checkmark marks whichever URL is currently in effect
@@ -381,7 +379,7 @@ fun PlaylistDetailScreen(
                                     Modifier
                                 },
                             )
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
                     ) {
                         val caps = playlist.capabilities()
                         // A denial reads as absence, never as an error: muted,
@@ -507,13 +505,8 @@ fun PlaylistDetailScreen(
             }
             // Profiles (2026-10-16): one Dispatcharr user per profile. Shown
             // only once the playlist has 2+ profiles, or to an Admin who can
-            // add one; a single-profile non-admin sees nothing new.
-            if (playlist.isDispatcharrDirectConnect()) item {
-                androidx.compose.foundation.layout.Column {
-                    ProfilesSection(playlistId = playlist.id)
-                    AskAtLaunchRow(playlistId = playlist.id)
-                }
-            }
+            // add one; a single-profile non-admin sees nothing new. Apple
+            // (iOS and tvOS) lists Profiles after Actions.
             if (isTv) {
             item {
                 Section(header = "Actions", footer = null) {
@@ -569,6 +562,12 @@ fun PlaylistDetailScreen(
                             status = state.lanRefreshStatus,
                         )
                     }
+                }
+            }
+            if (playlist.isDispatcharrDirectConnect()) item {
+                androidx.compose.foundation.layout.Column {
+                    ProfilesSection(playlistId = playlist.id)
+                    AskAtLaunchRow(playlistId = playlist.id)
                 }
             }
 
@@ -631,6 +630,16 @@ fun PlaylistDetailScreen(
                     }
                 }
             }
+            // iOS ServerDetailView: Actions, Set up a TV, then Profiles.
+            if (playlist.isDispatcharrDirectConnect()) {
+                item { SetUpAnotherDeviceSection(playlistId = playlist.id) }
+                item {
+                    androidx.compose.foundation.layout.Column {
+                        ProfilesSection(playlistId = playlist.id)
+                        AskAtLaunchRow(playlistId = playlist.id)
+                    }
+                }
+            }
 
             }
 
@@ -662,7 +671,7 @@ fun PlaylistDetailScreen(
                             text = "Last refreshed: ${LastRefreshedFormat.format(ts)}",
                             style = MaterialTheme.typography.bodySmall.subtext(),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                            modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 6.dp),
                         )
                     }
                 }
@@ -702,57 +711,45 @@ fun PlaylistDetailScreen(
     }
 
     if (confirmDelete && playlist != null) {
-        AlertDialog(
-            onDismissRequest = { confirmDelete = false },
-            title = { Text("Delete playlist?") },
-            text = {
-                Text(
-                    "This removes \"${playlist.name}\" and its credentials from this " +
-                        "device. If another playlist is saved, it becomes active.",
-                )
+        PlaylistDeleteConfirm(
+            playlistId = playlist.id,
+            playlistName = playlist.name,
+            countRecordings = viewModel::onDeviceRecordingCount,
+            onDismiss = { confirmDelete = false },
+            onDelete = { keep ->
+                confirmDelete = false
+                viewModel.deletePlaylist(playlist.id, keep)
+                onBack()
             },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Delete",
-                    destructive = true,
-                    onClick = {
-                        confirmDelete = false
-                        viewModel.deletePlaylist(playlist.id)
-                        onBack()
-                    },
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { confirmDelete = false })
-            },
-        )
+        ) { confirm ->
+            com.aeriotv.android.ui.settings.AlertPrompt(
+                onDismissRequest = { confirmDelete = false },
+                title = "Delete playlist?",
+                message = "This removes \"${playlist.name}\" and its credentials from this " +
+                    "device. If another playlist is saved, it becomes active.",
+                actions = listOf(
+                    com.aeriotv.android.ui.settings.AlertAction("Delete", com.aeriotv.android.ui.settings.AlertRole.Destructive) { confirm() },
+                    com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { confirmDelete = false },
+                ),
+            )
+        }
     }
 
     if (confirmRefreshAll && playlist != null) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { confirmRefreshAll = false },
-            title = { Text("Refresh Everything?") },
-            text = {
-                Text(
-                    "Clears all cached channels, guide data, and On Demand, then " +
-                        "reloads \"${playlist.name}\" from scratch. Use this if " +
-                        "channels or guide data are missing or stale. May take a " +
-                        "few minutes on large playlists.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Refresh",
-                    destructive = true,
-                    onClick = {
-                        confirmRefreshAll = false
-                        viewModel.refreshEverything()
-                    },
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { confirmRefreshAll = false })
-            },
+            title = "Refresh Everything?",
+            message = "Clears all cached channels, guide data, and On Demand, then " +
+                "reloads \"${playlist.name}\" from scratch. Use this if " +
+                "channels or guide data are missing or stale. May take a " +
+                "few minutes on large playlists.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Refresh", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    confirmRefreshAll = false
+                    viewModel.refreshEverything()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { confirmRefreshAll = false },
+            ),
         )
     }
 }
@@ -869,7 +866,7 @@ private fun ActionRow(
             // keeps its D-pad focus stop while a run is in flight; a disabled
             // clickable drops out of focus traversal entirely.
             .clickable(onClick = { if (!running && enabled) onClick() })
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(

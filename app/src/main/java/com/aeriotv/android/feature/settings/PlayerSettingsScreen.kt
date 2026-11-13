@@ -1,16 +1,19 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.filled.Radio
+import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.CropSquare
@@ -144,18 +147,20 @@ fun PlayerSettingsScreen(
         SettingsDetailTopBar(title = "Player", onBack = onBack)
 
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            val paneScroll = rememberScrollState()
             Column(
                 modifier = Modifier
                     .settingsFormWidth()
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .settingsPaneTopEdge(paneScroll)
+                    .verticalScroll(paneScroll)
                     .padding(
                         start = 16.dp,
                         end = 16.dp,
                         top = 12.dp,
                         bottom = LocalTabBarBottomInset.current,
                     ),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
             ) {
                 // MARK: On-Screen Display
                 //
@@ -183,6 +188,19 @@ fun PlayerSettingsScreen(
                         Triple("Program Description", "description", cardProgramDescription) to
                             viewModel::setPlayerCardShowProgramDescription,
                     )
+                    // GH #127 (Apple d051505): only the pop-up on a channel
+                    // change; the card still shows with the player controls.
+                    val popUpRow: @Composable () -> Unit = {
+                        SettingsToggleRow(
+                            title = "Pop Up Info Card on Channel Change",
+                            subtitle = "Show the channel and program card for a few seconds after a channel change. The card still appears with the player controls.",
+                            leadingIcon = if (isTv) Icons.Filled.FilterNone else null,
+                            checked = showChannelInfoCard,
+                            onCheckedChange = viewModel::setPlayerShowChannelInfoCard,
+                        )
+                    }
+                    // Apple lists the pop-up first, then Info Card (iOS and tvOS).
+                    popUpRow()
                     SettingsSubGroup(
                         title = "Info Card",
                         summary = settingsItemsSummary(
@@ -214,15 +232,6 @@ fun PlayerSettingsScreen(
                             )
                         }
                     }
-                    // GH #127 (Apple d051505): only the pop-up on a channel
-                    // change; the card still shows with the player controls.
-                    SettingsToggleRow(
-                        title = "Pop Up Info Card on Channel Change",
-                        subtitle = "Show the channel and program card for a few seconds after a channel change. The card still appears with the player controls.",
-                        leadingIcon = if (isTv) Icons.Filled.FilterNone else null,
-                        checked = showChannelInfoCard,
-                        onCheckedChange = viewModel::setPlayerShowChannelInfoCard,
-                    )
                 }
 
                 // MARK: Radio Mode
@@ -272,7 +281,10 @@ fun PlayerSettingsScreen(
                             title = "Live Rewind",
                             summary = formatDepthMinutes(snappedDepth),
                             leadingIcon = Icons.Filled.Replay30,
-                            footer = "How far back you can rewind the channel you are watching. Buffered video is released as soon as you leave the channel. Keeping recent channels live holds an extra stream connection per channel; opening a channel beyond the limit drops the oldest.",
+                            // iOS ends its sub-page footer with the kept-channels
+                            // sentence; Apple TV prints it under Channels to Keep.
+                            footer = "How far back you can rewind the channel you are watching. Buffered video is released as soon as you leave the channel. Keeping recent channels live holds an extra stream connection per channel; opening a channel beyond the limit drops the oldest." +
+                                if (isTv) "" else " Kept channels keep one connection to your server open until you stop them.",
                         ) {
                             // The sub-page host shows one page at a time and
                             // drops a body whose row leaves composition, so a
@@ -302,9 +314,6 @@ fun PlayerSettingsScreen(
                                 checked = keepRecent,
                                 onCheckedChange = viewModel::setLiveRewindKeepRecent,
                             )
-                            // One footer sentence under the toggle, every form
-                            // factor (Apple parity).
-                            SettingsSectionFooter("Kept channels keep one connection to your server open until you stop them.")
                             if (keepRecent) {
                                 SteppedSliderRow(
                                     label = "Channels to Keep",
@@ -314,6 +323,7 @@ fun PlayerSettingsScreen(
                                     onSelect = viewModel::setLiveRewindKeepCount,
                                 )
                             }
+                            if (isTv) SettingsSectionFooter("Each kept channel holds an extra stream connection and uses bandwidth while it runs. Opening a channel beyond the limit drops the oldest. Kept channels keep one connection to your server open until you stop them.")
                         }
                     }
                 }
@@ -371,7 +381,9 @@ fun PlayerSettingsScreen(
                             onSelect = viewModel::setSkipForwardSeconds,
                         )
                     }
-                    if (isTv) {
+                    // Apple TV lists Skip Without Controls under Gestures; a
+                    // Child (no Gestures section) keeps it here.
+                    if (isTv && childRole) {
                         // GH #94 (Apple parity): bare-video Left/Right skip.
                         SettingsToggleRow(
                             title = "Skip Without Controls",
@@ -430,8 +442,9 @@ fun PlayerSettingsScreen(
                     // tvOS / Android TV flip channels with D-pad up/down, not a
                     // swipe, so the "accidental swipes" caution is meaningless on
                     // a remote (user request: drop the note on TV). Phones keep it.
+                    // TV: Apple's footer sits between its two rows (below).
                     footer = if (isTv) {
-                        "Turn off if accidental D-pad presses are flipping channels during playback. Phones and tablets use the matching swipe-up / swipe-down gesture on the same toggle."
+                        null
                     } else {
                         "Turn off if accidental swipes during playback flip channels by mistake. " +
                             "Brightness and volume slides are recognized only inside a narrow band at the very edge of the screen, " +
@@ -450,6 +463,18 @@ fun PlayerSettingsScreen(
                         checked = appleTVChannelFlip,
                         onCheckedChange = viewModel::setAppleTVChannelFlip,
                     )
+                    if (isTv) {
+                        SettingsSectionFooter("Turn off if accidental D-pad presses are flipping channels during playback. Phones and tablets use the matching swipe-up / swipe-down gesture on the same toggle.")
+                        // GH #94 (Apple parity): bare-video Left/Right skip.
+                        SettingsToggleRow(
+                            title = "Skip Without Controls",
+                            subtitle = "With the controls hidden, Left and Right skip right away instead of opening the timeline.",
+                            // tvOS gobackward.
+                            leadingIcon = Icons.Filled.Replay,
+                            checked = skipWithoutControls,
+                            onCheckedChange = { v -> playerPrefsScope.launch { playerPrefs.setSkipWithoutControls(v) } },
+                        )
+                    }
                     if (!isTv) {
                         SettingsToggleRow(
                             title = "Edge Slide for Brightness",
@@ -531,6 +556,35 @@ fun PlayerSettingsScreen(
                         checked = multiviewShowLogos,
                         onCheckedChange = viewModel::setMultiviewShowLogos,
                     )
+                    val logoRows: @Composable () -> Unit = {
+                        if (multiviewShowLogos) {
+                            val corners = listOf(
+                                SettingsPickerOption("top_left", "Top Left"),
+                                SettingsPickerOption("top_right", "Top Right"),
+                                SettingsPickerOption("bottom_left", "Bottom Left"),
+                                SettingsPickerOption("bottom_right", "Bottom Right"),
+                            )
+                            SettingsPickerRow(
+                                title = "Logo Position",
+                                tvChoiceSheet = true,
+                                inlineTitle = true,
+                                options = corners,
+                                selected = corners.firstOrNull { it.value == multiviewLogoPosition }?.value
+                                    ?: "top_left",
+                                onSelect = viewModel::setMultiviewLogoPosition,
+                            )
+                            SteppedSliderRow(
+                                label = "Logo Size",
+                                values = listOf(5, 10, 15, 20, 25),
+                                selected = multiviewLogoSize,
+                                format = { "$it%" },
+                                onSelect = viewModel::setMultiviewLogoSize,
+                            )
+                        }
+                    }
+                    // Apple: the logo's position and size right under Show
+                    // Channel Logos (iOS and tvOS).
+                    logoRows()
                     SettingsToggleRow(
                         title = "Show Subtitles",
                         subtitle = "Show the program subtitle in the Add to Multiview picker",
@@ -543,30 +597,6 @@ fun PlayerSettingsScreen(
                         checked = multiviewPickerShowDescriptions,
                         onCheckedChange = viewModel::setMultiviewPickerShowDescriptions,
                     )
-                    if (multiviewShowLogos) {
-                        val corners = listOf(
-                            SettingsPickerOption("top_left", "Top Left"),
-                            SettingsPickerOption("top_right", "Top Right"),
-                            SettingsPickerOption("bottom_left", "Bottom Left"),
-                            SettingsPickerOption("bottom_right", "Bottom Right"),
-                        )
-                        SettingsPickerRow(
-                            title = "Logo Position",
-                            tvChoiceSheet = true,
-                            inlineTitle = true,
-                            options = corners,
-                            selected = corners.firstOrNull { it.value == multiviewLogoPosition }?.value
-                                ?: "top_left",
-                            onSelect = viewModel::setMultiviewLogoPosition,
-                        )
-                        SteppedSliderRow(
-                            label = "Logo Size",
-                            values = listOf(5, 10, 15, 20, 25),
-                            selected = multiviewLogoSize,
-                            format = { "$it%" },
-                            onSelect = viewModel::setMultiviewLogoSize,
-                        )
-                    }
                 }
 
                 // MARK: Display (TV only)
@@ -707,6 +737,19 @@ internal fun SteppedSliderRow(
     // custom dialog) to the nearest ladder stop for display; the pref
     // itself is only rewritten when the user moves the slider.
     val idx = values.indices.minByOrNull { abs(values[it] - selected) } ?: 0
+    if (rememberIsTvDevice()) {
+        // Apple TV draws every stepped row as one pill per stop
+        // (tvSteppedSegmentsRow), its footer under the card.
+        TvSegmentsRow(
+            label = label,
+            value = values[idx].toFloat(),
+            onValueChange = { v -> v.toInt().let { if (it != selected) onSelect(it) } },
+            modifier = Modifier.fillMaxWidth(),
+            segments = values.map { it.toFloat() to format(it) },
+        )
+        if (footer != null) SettingsSectionFooter(footer)
+        return
+    }
     SettingsSliderRow(
         label = label,
         valueText = format(values[idx]),

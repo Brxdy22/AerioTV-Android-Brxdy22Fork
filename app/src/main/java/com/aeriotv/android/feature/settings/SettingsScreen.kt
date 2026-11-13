@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import com.aeriotv.android.ui.scale.subtext
 import com.aeriotv.android.ui.theme.textAccent
 import androidx.compose.foundation.background
@@ -73,6 +74,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
@@ -252,17 +255,21 @@ fun SettingsScreen(
             // Full-screen measures the WINDOW; a detail pane must measure the
             // PANE or it sizes itself against the whole tablet and overflows.
             modifier = Modifier.settingsFormWidth()
-                .fillMaxSize(),
+                .fillMaxSize()
+                .settingsPaneTopEdge(listState),
             contentPadding = PaddingValues(
                 start = 16.dp,
                 end = 16.dp,
-                top = 12.dp,
+                // iPhone (Apple 6fde56b): 29 pt from the title's glyphs to the
+                // PLAYLISTS header's, as between sections. The phone root sat
+                // 6 dp lower (35).
+                top = if (fullRoot && !isTv) 6.25.dp else 12.dp,
                 // TV: keep the last row above the ~5% bottom overscan band.
                 // Phones reserve the floating tab pill / cast controls the same
                 // way every other scrolling surface does.
                 bottom = if (rememberIsTvDevice()) 28.dp else LocalTabBarBottomInset.current,
             ),
-            verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing),
+            verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing)),
         ) {
             // MARK: Set up a TV banner
             //
@@ -299,7 +306,8 @@ fun SettingsScreen(
                     onActivate = { pl -> viewModel.switchToPlaylist(pl.id) },
                     onAdd = onAddPlaylist,
                     onEdit = { pl -> onEditPlaylist(pl.id) },
-                    onDelete = { pl -> viewModel.deletePlaylist(pl.id) },
+                    onDelete = { pl, keep -> viewModel.deletePlaylist(pl.id, keep) },
+                    countRecordings = viewModel::onDeviceRecordingCount,
                 )
             }
 
@@ -420,7 +428,8 @@ private fun PlaylistsSection(
     onActivate: ((PlaylistEntity) -> Unit)? = null,
     onAdd: () -> Unit,
     onEdit: (PlaylistEntity) -> Unit,
-    onDelete: (PlaylistEntity) -> Unit,
+    onDelete: (PlaylistEntity, keepRecordings: Boolean) -> Unit,
+    countRecordings: suspend (String) -> Int,
 ) {
     val isTv = rememberIsTvDevice()
     // Apple's row context menu (long press): on tvOS "Use This Playlist"
@@ -453,7 +462,7 @@ private fun PlaylistsSection(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { showSetUpTv = true }
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                        .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(Icons.Filled.Tv, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
@@ -467,7 +476,7 @@ private fun PlaylistsSection(
                     }
                     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                RowDivider()
+                PlaylistCardDivider()
             }
             if (playlists.isEmpty()) {
                 Box(
@@ -484,7 +493,7 @@ private fun PlaylistsSection(
                 }
             } else {
                 playlists.forEachIndexed { index, pl ->
-                    if (index > 0) RowDivider()
+                    if (index > 0) PlaylistCardDivider()
                     PlaylistRow(
                         playlist = pl,
                         isActive = pl.id == activeId,
@@ -498,7 +507,7 @@ private fun PlaylistsSection(
                         onActivate = if (isTv) null else onActivate?.let { act -> { act(pl) } },
                     )
                 }
-                RowDivider()
+                PlaylistCardDivider()
             }
             // Add Playlist row - iOS calls this out with a cyan plus glyph
             // (SettingsView line 206-220).
@@ -507,9 +516,19 @@ private fun PlaylistsSection(
                 modifier = Modifier
                     .fillMaxWidth()
                     .onFocusChanged { addFocused = it.isFocused }
+                    .then(
+                        // Apple TV's TVSettingsActionRow: the standard pane
+                        // row height (46 dp, tvOS 92 pt).
+                        if (isTv) Modifier.heightIn(min = com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowMinHeight) else Modifier,
+                    )
                     .groupRowFocus(addFocused)
                     .clickable(onClick = onAdd)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                    .padding(
+                        horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(),
+                        // iPhone (Apple 6fde56b): the Add Playlist row is 54.5
+                        // pt tall around its 24 dp leading column.
+                        vertical = if (isTv) com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowPaddingV else 15.dp,
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (isTv) {
@@ -529,19 +548,23 @@ private fun PlaylistsSection(
                         )
                     }
                 } else {
+                    // iPhone and iPad: plus.circle.fill, its 20 dp ink in the
+                    // 24 dp leading column every row in this card shares.
                     Icon(
-                        imageVector = Icons.Filled.Add,
+                        imageVector = Icons.Filled.AddCircle,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp),
+                        modifier = Modifier.size(PlaylistCardLeadingColumn),
                     )
                 }
-                Spacer(Modifier.size(10.dp))
+                Spacer(Modifier.size(if (isTv) com.aeriotv.android.ui.settings.TvSettingsMetrics.iconTileGap else PlaylistCardLeadingGap))
                 Text(
                     text = "Add Playlist",
-                    style = settingsRowValueStyle(),
+                    // Apple TV: the standard row title (24 pt regular) in
+                    // the accent. Touch keeps its medium value style.
+                    style = if (isTv) settingsRowTitleStyle() else settingsRowValueStyle(),
                     color = MaterialTheme.colorScheme.textAccent,
-                    fontWeight = FontWeight.Medium,
+                    fontWeight = if (isTv) FontWeight.Normal else FontWeight.Medium,
                 )
             }
             // No Manage Playlists row: Apple has none on any platform (the
@@ -551,15 +574,27 @@ private fun PlaylistsSection(
             // Apple's playlistFooterHint, verbatim per platform: the TV row
             // is one focus stop with no circle, so tvOS points at Actions.
             if (isTv) {
-                // tvOS pane: plain sentence, no glyph (Apple Phase 3 item 10).
-                SectionFooter("Select a playlist to open it, then Set Active in its Actions to make it active.")
+                // tvOS pane: plain sentence, no glyph (Apple Phase 3 item 10),
+                // as Apple TV sets it: 24 pt medium in the primary ink at
+                // 70%, level with the cards' left edge, 20 pt below the Add
+                // Playlist card.
+                Text(
+                    text = "Select a playlist to open it, then Set Active in its Actions to make it active.",
+                    style = settingsRowTitleStyle(),
+                    fontWeight = FontWeight.Medium,
+                    // SF's natural tracking: Android's title tracking ran
+                    // this sentence about 13% wider than Apple TV's.
+                    letterSpacing = 0.sp,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                    modifier = Modifier.padding(top = 10.dp),
+                )
             } else {
                 // iPhone/iPad: Label with the list.bullet glyph. Apple's second
                 // line ("Tap Edit to reorder") is NOT mirrored: Apple removed
                 // reordering on 2026-09-18 and the hint now names a control
                 // that does not exist on either platform.
                 Row(
-                    modifier = Modifier.padding(horizontal = 16.dp),
+                    modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH()),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
@@ -615,30 +650,27 @@ private fun PlaylistsSection(
     }
 
     pendingDelete?.let { pl ->
-        // Apple's root-list alert, word for word.
-        com.aeriotv.android.ui.scale.AlertDialog(
-            onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete Playlist?") },
-            text = {
-                Text("This will remove \"${pl.name}\" from the app. Your server data will not be affected.")
+        PlaylistDeleteConfirm(
+            playlistId = pl.id,
+            playlistName = pl.name,
+            countRecordings = countRecordings,
+            onDismiss = { pendingDelete = null },
+            onDelete = { keep ->
+                pendingDelete = null
+                onDelete(pl, keep)
             },
-            confirmButton = {
-                com.aeriotv.android.ui.settings.SettingsDialogTextButton(
-                    label = "Delete",
-                    destructive = true,
-                    onClick = {
-                        pendingDelete = null
-                        onDelete(pl)
-                    },
-                )
-            },
-            dismissButton = {
-                com.aeriotv.android.ui.settings.SettingsDialogTextButton(
-                    label = "Cancel",
-                    onClick = { pendingDelete = null },
-                )
-            },
-        )
+        ) { confirm ->
+            // Apple's root-list alert, word for word.
+            com.aeriotv.android.ui.settings.AlertPrompt(
+                onDismissRequest = { pendingDelete = null },
+                title = "Delete Playlist?",
+                message = "This will remove \"${pl.name}\" from the app. Your server data will not be affected.",
+                actions = listOf(
+                    com.aeriotv.android.ui.settings.AlertAction("Delete", com.aeriotv.android.ui.settings.AlertRole.Destructive) { confirm() },
+                    com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingDelete = null },
+                ),
+            )
+        }
     }
 }
 
@@ -658,10 +690,18 @@ private fun PlaylistRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .then(
+                    // Apple TV's TVSettingsNavRow: the standard pane row
+                    // height and padding (ServerListRow inside it).
+                    if (isTv) Modifier.heightIn(min = com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowMinHeight) else Modifier,
+                )
                 .onFocusChanged { focused = it.isFocused }
                 .groupRowFocus(focused)
                 .combinedClickable(onClick = onTap, onLongClick = onLongPress)
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                .padding(
+                    horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(),
+                    vertical = if (isTv) com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowPaddingV else 14.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // Radio-button active marker - filled cyan dot inside a ring on
@@ -678,14 +718,17 @@ private fun PlaylistRow(
                     contentDescription = if (isActive) "Active" else "Set as active playlist",
                     tint = if (isActive) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(20.dp),
+                    // Apple TV: checkmark.circle.fill at 28 pt, drawn 14 dp.
+                    // iPhone and iPad: 20 dp of ink in the card's 24 dp
+                    // leading column (Apple 6fde56b: circle at x 33.7).
+                    modifier = Modifier.size(if (isTv) 17.dp else PlaylistCardLeadingColumn),
                 )
             }
             if (!isTv && onActivate != null && !isActive) {
                 // 44dp target without changing the drawn size: requiredSize
-                // overflows the row's own 14dp vertical padding box.
+                // overflows the row's own vertical padding box.
                 Box(
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(PlaylistCardLeadingColumn),
                     contentAlignment = Alignment.Center,
                 ) {
                     Box(
@@ -702,8 +745,15 @@ private fun PlaylistRow(
             } else {
                 glyph()
             }
-            Spacer(Modifier.size(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
+            // Apple TV: 14 pt from the glyph to the name. iPhone and iPad:
+            // the Add Playlist row's 12 pt, so every name in the card starts
+            // on one edge (Apple 6fde56b).
+            Spacer(Modifier.size(if (isTv) 6.5.dp else PlaylistCardLeadingGap))
+            // The standard row's 2 pt between the name and its subtitle.
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
                 // Logan 2026-09-18, one row on both platforms: name, then
                 // "<Type> \u00B7 <N> channels". The source-type pill and the
                 // monospace URL line are gone - a provider URL can carry
@@ -724,7 +774,10 @@ private fun PlaylistRow(
                     // ACTIVE playlist (the only one whose channels are loaded);
                     // other rows read their type alone.
                     text = if (isActive) playlist.playlistRowSubtitle() else playlist.sourceTypeBadgeLabel(),
-                    style = settingsFootnoteStyle().subtext(),
+                    // The standard row subtitle at secondary contrast, through
+                    // Text Contrast (Apple 6fde56b, every platform; it was a
+                    // smaller footnote line).
+                    style = com.aeriotv.android.ui.settings.settingsRowSubtitleStyle().subtext(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
@@ -736,7 +789,8 @@ private fun PlaylistRow(
             Box(
                 modifier = Modifier
                     .padding(horizontal = 8.dp)
-                    .size(if (isTv) 12.dp else 8.dp)
+                    // Apple: a 12 pt dot on Apple TV (6 dp), 8 pt on iPhone.
+                    .size(if (isTv) 6.dp else 8.dp)
                     .clip(androidx.compose.foundation.shape.CircleShape)
                     .background(
                         if (playlist.channelCount > 0) MaterialTheme.colorScheme.primary
@@ -747,6 +801,8 @@ private fun PlaylistRow(
                 imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                // Apple TV: chevron.right at 22 pt, drawn 5.75 by 9.75 dp.
+                modifier = if (isTv) Modifier.size(19.5.dp) else Modifier,
             )
         }
     }
@@ -849,35 +905,35 @@ private fun AboutSection(
         // Apple TV draws About as ONE grouped card with hairlines.
         com.aeriotv.android.ui.settings.SettingsCard(grouped = true) {
             AboutInfoRow("Device", deviceDisplayName())
-            RowDivider()
+            AboutDivider()
             AboutInfoRow("System", "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})")
-            RowDivider()
+            AboutDivider()
             AboutVersionRow(
                 value = "$versionName ($versionCode)",
                 onClick = onShowWhatsNew,
             )
-            RowDivider()
+            AboutDivider()
             AboutInfoRow("First Installed", formatInstallTime(installedAt))
-            RowDivider()
+            AboutDivider()
             AboutInfoRow(
                 "Last Updated",
                 if (updatedAt > 0 && updatedAt != installedAt) formatInstallTime(updatedAt) else "Never",
             )
-            RowDivider()
+            AboutDivider()
             // Apple's order differs per platform (AboutSettingsView): iOS is
             // Copy to Clipboard, Open Source Licenses, Developer Website,
             // Report an Issue; tvOS has no Copy (no clipboard to paste into)
             // and ends with Open Source Licenses.
             if (!isTv) {
                 AboutActionRow("Copy to Clipboard", Icons.Filled.ContentCopy, onClick = onCopy)
-                RowDivider()
+                AboutDivider()
                 AboutActionRow(
                     "Open Source Licenses",
                     Icons.Outlined.Description,
                     onClick = onOpenLicenses,
                     chevron = true,
                 )
-                RowDivider()
+                AboutDivider()
             }
             AboutActionRow(
                 "Developer Website",
@@ -885,7 +941,7 @@ private fun AboutSection(
                 onClick = onOpenWebsite,
                 external = true,
             )
-            RowDivider()
+            AboutDivider()
             AboutActionRow(
                 "Report an Issue",
                 // Apple: exclamationmark.bubble.
@@ -894,7 +950,7 @@ private fun AboutSection(
                 external = true,
             )
             if (isTv) {
-                RowDivider()
+                AboutDivider()
                 AboutActionRow(
                     "Open Source Licenses",
                     Icons.Outlined.Description,
@@ -917,23 +973,67 @@ private fun AboutSection(
     }
 }
 
+// Apple TV's About card (AboutSettingsView tvAboutRow), halved: 26 pt text
+// (the label medium, in the secondary ink), rows padded 24 by 18 pt, and
+// hairlines 16 pt in from both card edges. Phones and tablets keep theirs.
+private val AboutTvTextSize = 13.sp
+private val AboutTvLineHeight = 15.5.sp
+private val AboutTvPaddingH = 12.dp
+private val AboutTvPaddingV = 9.dp
+
+@Composable
+private fun aboutRowPadding(): Modifier = if (rememberIsTvDevice()) {
+    Modifier.padding(horizontal = AboutTvPaddingH, vertical = AboutTvPaddingV)
+} else {
+    Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+}
+
+@Composable
+private fun aboutLabelStyle(): androidx.compose.ui.text.TextStyle =
+    if (rememberIsTvDevice()) {
+        settingsRowValueStyle().copy(fontSize = AboutTvTextSize, lineHeight = AboutTvLineHeight, fontWeight = FontWeight.Medium).subtext()
+    } else {
+        settingsRowValueStyle().subtext()
+    }
+
+@Composable
+private fun aboutValueStyle(): androidx.compose.ui.text.TextStyle =
+    if (rememberIsTvDevice()) {
+        settingsRowValueStyle().copy(fontSize = AboutTvTextSize, lineHeight = AboutTvLineHeight)
+    } else {
+        settingsRowValueStyle()
+    }
+
+@Composable
+private fun AboutDivider() {
+    if (rememberIsTvDevice()) {
+        androidx.compose.material3.HorizontalDivider(
+            thickness = 1.dp,
+            color = com.aeriotv.android.ui.settings.settingsDividerColor(),
+            modifier = Modifier.padding(horizontal = 8.dp),
+        )
+    } else {
+        RowDivider()
+    }
+}
+
 @Composable
 private fun AboutInfoRow(label: String, value: String) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .then(aboutRowPadding()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = label,
-            style = settingsRowValueStyle().subtext(),
+            style = aboutLabelStyle(),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.weight(1f),
         )
         Text(
             text = value,
-            style = settingsRowValueStyle(),
+            style = aboutValueStyle(),
             color = MaterialTheme.colorScheme.onBackground,
         )
     }
@@ -955,25 +1055,25 @@ private fun AboutVersionRow(value: String, onClick: () -> Unit) {
             .onFocusChanged { focused = it.isFocused }
             .groupRowFocus(focused)
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .then(aboutRowPadding()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = "App Version",
-            style = settingsRowValueStyle().subtext(),
+            style = aboutLabelStyle(),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.weight(1f),
         )
         Text(
             text = value,
-            style = settingsRowValueStyle(),
+            style = aboutValueStyle(),
             color = MaterialTheme.colorScheme.onBackground,
         )
         Spacer(Modifier.size(10.dp))
         Text(
-            // Apple: caption in textTertiary, dim chevron.
+            // Apple: caption in textTertiary, dim chevron (tvOS 22 pt).
             text = "What's New",
-            style = settingsFootnoteStyle().subtext(),
+            style = (if (rememberIsTvDevice()) settingsRowValueStyle() else settingsFootnoteStyle()).subtext(),
             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
         )
         Icon(
@@ -1000,7 +1100,7 @@ private fun AboutActionRow(
             .onFocusChanged { focused = it.isFocused }
             .groupRowFocus(focused)
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .then(aboutRowPadding()),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         val isTv = rememberIsTvDevice()
@@ -1017,7 +1117,7 @@ private fun AboutActionRow(
         }
         Text(
             text = label,
-            style = settingsRowValueStyle().subtext(),
+            style = aboutLabelStyle(),
             // Apple TV: Open Source Licenses reads in the primary text color.
             color = if (isTv && chevron) MaterialTheme.colorScheme.onBackground
             else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1037,8 +1137,9 @@ private fun AboutActionRow(
             Icon(
                 imageVector = Icons.Filled.QrCode,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(18.dp),
+                // Apple: qrcode at 24 pt in the primary text color.
+                tint = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.size(15.dp),
             )
         } else if (external) {
             Icon(
@@ -1068,8 +1169,26 @@ private fun SectionFooter(text: String) {
         // have quietly enlarged frozen phone canon.
         style = (if (rememberIsTvDevice()) settingsFootnoteStyle()
         else MaterialTheme.typography.labelSmall).subtext(),
-        color = com.aeriotv.android.ui.settings.settingsDimTint(),
-        modifier = Modifier.padding(horizontal = 16.dp),
+        // TV: Apple TV's footer ink, textTertiary.
+        color = if (rememberIsTvDevice()) MaterialTheme.colorScheme.tertiary else com.aeriotv.android.ui.settings.settingsDimTint(),
+        modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH()),
+    )
+}
+
+/** The Playlists card's leading column (circle, plus, TV glyph) on touch. */
+private val PlaylistCardLeadingColumn = 24.dp
+/** From that column to the row's text on touch: Apple's 12 pt. */
+private val PlaylistCardLeadingGap = 12.dp
+
+/**
+ * The Playlists card's hairline: on touch it starts under the rows' text
+ * (16 dp row inset, the 24 dp leading column, and the 12 dp gap), as
+ * Apple 6fde56b draws it; on TV each row is its own card and draws none.
+ */
+@Composable
+private fun PlaylistCardDivider() {
+    com.aeriotv.android.ui.settings.SettingsRowDivider(
+        startInset = 16.dp + PlaylistCardLeadingColumn + PlaylistCardLeadingGap,
     )
 }
 

@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import com.aeriotv.android.ui.theme.textAccent
 import androidx.compose.foundation.layout.Arrangement
@@ -77,8 +78,9 @@ private val GUIDE_SLOTS = listOf(
 )
 private val GUIDE_EXTENDED_SLOTS = listOf(
     RemoteSlot.PLAY_PAUSE, RemoteSlot.FFWD, RemoteSlot.REWIND,
-    RemoteSlot.CHANNEL_UP, RemoteSlot.CHANNEL_DOWN,
 )
+/** Channel Up and Down in the guide: the end of "In the TV Guide", as on Apple TV. */
+private val GUIDE_CHANNEL_SLOTS = listOf(RemoteSlot.CHANNEL_UP, RemoteSlot.CHANNEL_DOWN)
 
 /** Player actions offered in the picker: only actions the executor can
  *  actually run today (implementer note: omit rather than fake). */
@@ -313,13 +315,15 @@ fun RemoteControlSettingsScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         SettingsDetailTopBar(title = "Remote Control", onBack = onBack)
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            val paneScroll = rememberScrollState()
             Column(
                 modifier = Modifier
                     .settingsFormWidth()
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .settingsPaneTopEdge(paneScroll)
+                    .verticalScroll(paneScroll)
                     .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = LocalTabBarBottomInset.current),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
             ) {
                 SettingsSection(header = "On-Screen Hints") {
                     SettingsToggleRow(
@@ -393,6 +397,13 @@ fun RemoteControlSettingsScreen(
                             onClick = { editingGuideSlot = slot },
                         )
                     }
+                    GUIDE_CHANNEL_SLOTS.forEach { slot ->
+                        SlotRow(
+                            slotName = slot.displayName,
+                            valueName = map.guideAction(slot).displayName(groupSelector == "sidebar"),
+                            onClick = { editingGuideSlot = slot },
+                        )
+                    }
                 }
 
                 SettingsSection(
@@ -450,12 +461,12 @@ fun RemoteControlSettingsScreen(
                             tint = MaterialTheme.colorScheme.error,
                             modifier = Modifier.size(22.dp),
                         )
-                        Spacer(Modifier.width(14.dp))
+                        Spacer(Modifier.width(com.aeriotv.android.ui.settings.settingsTileGap()))
                         Text(
                             text = "Reset to Defaults",
                             style = com.aeriotv.android.ui.settings.settingsRowTitleStyle(),
                             color = MaterialTheme.colorScheme.error,
-                            fontWeight = FontWeight.Medium,
+                            fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -616,7 +627,9 @@ private fun SlotRow(
                 text = slotName,
                 style = com.aeriotv.android.ui.settings.settingsRowTitleStyle(),
                 color = MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.Medium,
+                // Apple TV (a22268e): Remote Control rows use the standard
+                // row title, regular weight.
+                fontWeight = com.aeriotv.android.ui.settings.settingsRowTitleWeight(),
             )
             if (subtitle != null) {
                 Text(

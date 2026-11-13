@@ -1,14 +1,12 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.RadioButtonChecked
 import androidx.compose.material.icons.filled.Autorenew
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import com.aeriotv.android.ui.scale.subtext
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -93,18 +91,20 @@ fun GeneralSettingsScreen(
         SettingsDetailTopBar(title = "General", onBack = onBack)
 
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            val paneScroll = rememberScrollState()
             Column(
                 modifier = Modifier
                     .settingsFormWidth()
                     .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
+                    .settingsPaneTopEdge(paneScroll)
+                    .verticalScroll(paneScroll)
                     .padding(
                         start = 16.dp,
                         end = 16.dp,
                         top = 12.dp,
                         bottom = LocalTabBarBottomInset.current,
                     ),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
             ) {
                 // MARK: Startup
                 //
@@ -309,29 +309,12 @@ fun GeneralSettingsScreen(
                             onIndexChange = { viewModel.setNetworkTimeoutSecs(TIMEOUT_STOPS[it].toDouble()) },
                             dimValue = true,
                         )
-                    }
-                }
-
-                // Max Retries stays a stepper (no tvOS equivalent), on a resting card.
-                SettingsSection(
-                    header = "",
-                    footer = "Per-request retry budget (0-10).",
-                ) {
-                    if (isTv) {
-                        // Same minus / value / plus stepper as Text Size on
-                        // Appearance (D-pad Left / Right on one row).
-                        com.aeriotv.android.ui.settings.SettingsIntStepperRow(
-                            title = "Max Retries",
-                            options = (0..10).toList(),
-                            value = maxRetries,
-                            onValueChange = { viewModel.setMaxRetries(it) },
-                        )
-                    } else {
+                        // iOS: Max Retries in Network, right after Request Timeout.
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .settingsRowCard(focused = false)
-                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                                .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
@@ -363,6 +346,23 @@ fun GeneralSettingsScreen(
                             }
                         }
                     }
+                }
+
+                // Max Retries: a stepper on its own resting card on TV (tvOS has
+                // no Max Retries row); phones and tablets list it in Network,
+                // after Request Timeout, as iOS does.
+                if (isTv) SettingsSection(
+                    header = "",
+                    footer = "Per-request retry budget (0-10).",
+                ) {
+                    // Same minus / value / plus stepper as Text Size on
+                    // Appearance (D-pad Left / Right on one row).
+                    com.aeriotv.android.ui.settings.SettingsIntStepperRow(
+                        title = "Max Retries",
+                        options = (0..10).toList(),
+                        value = maxRetries,
+                        onValueChange = { viewModel.setMaxRetries(it) },
+                    )
                 }
             }
         }
@@ -435,11 +435,16 @@ private val ABOUT_REFRESHING_ITEMS = listOf(
 )
 
 /**
- * Informational row: same card, padding, and type as the other settings rows
- * (accent glyph, bold title, wrapped secondary body). On TV it is a D-pad
- * stop through [SettingsRowContainer] (same focus ring and bring-into-view as
- * every other row, no-op select) so the section scrolls one row at a time and
- * all four rows stay readable. On touch it stays a plain, non-clickable card.
+ * Informational row: same card, padding, and type as the other settings rows.
+ * Touch keeps the iPhone's About Refreshing row (accent glyph, semibold title,
+ * wrapped secondary body). TV draws Apple TV's standard pane row, as every
+ * other icon row on the page does: the icon tile, the regular row title, and
+ * the row subtitle (Apple TV's sweep in a22268e left no bare glyph or bold
+ * title in a pane row; tvOS has no About Refreshing section of its own). On
+ * TV it is a D-pad stop through [SettingsRowContainer] (same focus ring and
+ * bring-into-view as every other row, no-op select) so the section scrolls
+ * one row at a time and all four rows stay readable. On touch it stays a
+ * plain, non-clickable card.
  */
 @Composable
 private fun AboutRefreshingRow(item: AboutRefreshingItem) {
@@ -454,7 +459,7 @@ private fun AboutRefreshingRow(item: AboutRefreshingItem) {
             .fillMaxWidth()
             .heightIn(min = 52.dp)
             .settingsRowCard(false)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 12.dp),
         verticalAlignment = Alignment.Top,
     ) {
         AboutRefreshingRowContent(item)
@@ -463,24 +468,24 @@ private fun AboutRefreshingRow(item: AboutRefreshingItem) {
 
 @Composable
 private fun androidx.compose.foundation.layout.RowScope.AboutRefreshingRowContent(item: AboutRefreshingItem) {
+    val isTv = rememberIsTvDevice()
     run {
-        Icon(
-            imageVector = item.icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(22.dp),
-        )
-        Spacer(Modifier.width(14.dp))
+        // TV: the tile, 7 dp from the text. Touch: the 22 dp glyph, 14 dp.
+        com.aeriotv.android.ui.settings.SettingsLeadingGlyph(item.icon)
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = item.title,
                 style = settingsRowTitleStyle(),
                 color = MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.SemiBold,
+                fontWeight = if (isTv) com.aeriotv.android.ui.settings.settingsRowTitleWeight() else FontWeight.SemiBold,
             )
             Text(
                 text = item.body,
-                style = com.aeriotv.android.ui.settings.settingsFootnoteStyle().subtext(),
+                style = if (isTv) {
+                    com.aeriotv.android.ui.settings.settingsRowSubtitleStyle().subtext()
+                } else {
+                    com.aeriotv.android.ui.settings.settingsFootnoteStyle().subtext()
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }

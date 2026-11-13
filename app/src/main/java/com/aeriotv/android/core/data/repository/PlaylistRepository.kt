@@ -321,6 +321,14 @@ class PlaylistRepository @Inject constructor(
          * 2026-11-10). Ignored for an edit, and when a row already has it.
          */
         val newId: String? = null,
+        /**
+         * [password] is the saved one Edit Playlist showed, not one the user
+         * typed: it goes only to a proven address (StoredSecrets). Every
+         * other caller sends what was typed or handed over, so false.
+         */
+        val storedPassword: Boolean = false,
+        /** [apiKey] is the saved key Edit Playlist showed, not one the user typed. */
+        val storedApiKey: Boolean = false,
     )
 
     /**
@@ -403,6 +411,10 @@ class PlaylistRepository @Inject constructor(
         if (playlist.username.isNullOrBlank() || playlist.password.isNullOrBlank()) {
             return Result.failure(IllegalStateException("Username and password required."))
         }
+        // The saved password only to a proven address (StoredSecrets).
+        if (!com.aeriotv.android.core.profiles.StoredSecrets.check(playlistId, playlist.urlString, com.aeriotv.android.core.profiles.StoredSecrets.Path.RefreshSession)) {
+            return Result.failure(com.aeriotv.android.core.profiles.StoredSecrets.Refused(com.aeriotv.android.core.profiles.StoredSecrets.TYPE_PASSWORD_AT_NEW_ADDRESS))
+        }
         val fresh = dispatcharrAuth.silentRebootstrapApiKey(playlist)
             ?: return Result.failure(IllegalStateException("Refresh failed. Check the URL and credentials."))
         return Result.success(fresh.trim() != previousKey)
@@ -416,6 +428,7 @@ class PlaylistRepository @Inject constructor(
             val pass = row.password?.takeIf { it.isNotBlank() }
             if (user == null || pass == null) throw IllegalStateException("Username and password required.")
             val base = row.urlString.trimEnd('/')
+            if (!com.aeriotv.android.core.profiles.StoredSecrets.check(playlistId, base, com.aeriotv.android.core.profiles.StoredSecrets.Path.RefreshSession)) throw com.aeriotv.android.core.profiles.StoredSecrets.Refused(com.aeriotv.android.core.profiles.StoredSecrets.TYPE_PASSWORD_AT_NEW_ADDRESS)
             val key = try {
                 val jwt = dispatcharrClient.login(base, user, pass)
                 dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
@@ -553,6 +566,10 @@ class PlaylistRepository @Inject constructor(
         // for another (the caller shows Fix Login's existing failure line).
         kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
             val row = dao.byId(playlistId) ?: throw NoSuchElementException("playlist not here")
+            // A sign-in sent from another device is a stored secret: it goes
+            // only to a proven address (StoredSecrets), never to one whose
+            // change is unproven.
+            if (!com.aeriotv.android.core.profiles.StoredSecrets.check(playlistId, row.urlString, com.aeriotv.android.core.profiles.StoredSecrets.Path.FixLogin)) throw com.aeriotv.android.core.profiles.StoredSecrets.Refused(com.aeriotv.android.core.profiles.StoredSecrets.FIX_LOGIN_NEW_ADDRESS)
             requireSameAccount(playlistId, row, verifySentSignIn(row, sent))
         }
         writeSignIn(playlistId, sent, "fix login")
@@ -565,7 +582,7 @@ class PlaylistRepository @Inject constructor(
     ): com.aeriotv.android.core.network.MeResponse {
         val base = row.urlString.trimEnd('/')
         sent?.apiKey?.trim()?.takeIf { it.isNotEmpty() }?.let { key ->
-            return dispatcharrClient.fetchMe(base, key)
+            return dispatcharrClient.fetchMe(base, key, keyCheck = true)
                 ?: throw com.aeriotv.android.core.network.DispatcharrError.InvalidCredentials("The sent sign-in was not accepted.")
         }
         val user = sent?.username?.trim()?.takeIf { it.isNotEmpty() }
@@ -573,7 +590,7 @@ class PlaylistRepository @Inject constructor(
         if (user == null || pass == null) throw IllegalArgumentException("no sign-in sent")
         val jwt = dispatcharrClient.login(base, user, pass)
         val key = dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
-        return dispatcharrClient.fetchMe(base, key)
+        return dispatcharrClient.fetchMe(base, key, keyCheck = true)
             ?: throw com.aeriotv.android.core.network.DispatcharrError.InvalidCredentials("The sent sign-in was not accepted.")
     }
 
@@ -619,7 +636,7 @@ class PlaylistRepository @Inject constructor(
             val key = dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
             // Item 11: only the playlist's current account reconnects. On a
             // mismatch nothing is written and the token is dropped unused.
-            val me = dispatcharrClient.fetchMe(base, key)
+            val me = dispatcharrClient.fetchMe(base, key, keyCheck = true)
                 ?: throw com.aeriotv.android.core.network.DispatcharrError.Transport("Could not read the account.")
             requireSameAccount(playlistId, row, me)
             val updated = writeSignIn(
@@ -630,6 +647,8 @@ class PlaylistRepository @Inject constructor(
             // After the write: a changed account drops the old pair there.
             dispatcharrTokenStore.store(playlistId, jwt.access, jwt.refresh)
             com.aeriotv.android.core.network.DispatcharrLoginGate.reset(playlistId)
+            // Typed at the playlist's server URL: that address is the user's (StoredSecrets).
+            profileManager.get().noteTypedSignIn(playlistId, at = base)
             updated
         }
     }
@@ -890,6 +909,8 @@ class PlaylistRepository @Inject constructor(
         // wiped, and storing it before the drop-or-fail decision would leave
         // the NEW account's tokens behind after a failed save.
         var pendingJwt: com.aeriotv.android.core.network.JwtPair? = null
+        // A password or key the user TYPED in this save signed in (StoredSecrets: it proves the address).
+        var typedSignedIn = false
         val resolvedApiKey: String? = when (sourceType) {
             SourceType.DispatcharrUserPass -> {
                 // A playlist ORIGINALLY added with username/password can be
@@ -927,6 +948,19 @@ class PlaylistRepository @Inject constructor(
                     // silent rebootstrap re-mints from the stored credentials,
                     // exactly as it does outside this screen.
                     priorRow.apiKey
+                } else if (
+                    priorRow != null && request.storedPassword &&
+                    !com.aeriotv.android.core.profiles.StoredSecrets.mayUse(priorRow.id, normalisedBase)
+                ) {
+                    // A new address and no typed password (security fix
+                    // 2026-11-12): the password the form showed is the saved
+                    // one, and it goes only to a proven address. The
+                    // playlist's own key may go there (the user chose the
+                    // address); the check below makes it answer there as
+                    // this playlist's account.
+                    com.aeriotv.android.core.profiles.StoredSecrets.noteRefused(priorRow.id, com.aeriotv.android.core.profiles.StoredSecrets.Path.EditPlaylistSignIn)
+                    priorRow.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: throw com.aeriotv.android.core.profiles.StoredSecrets.Refused(com.aeriotv.android.core.profiles.StoredSecrets.TYPE_PASSWORD_AT_NEW_ADDRESS)
                 } else {
                     val user = u ?: throw IllegalArgumentException("Username is required")
                     val pass = p ?: throw IllegalArgumentException("Password is required")
@@ -934,6 +968,7 @@ class PlaylistRepository @Inject constructor(
                     // thing standing between Save and the channel fetch.
                     enterStage(SaveStage.VerifyingCredentials)
                     val jwt = dispatcharrClient.login(normalisedBase, user, pass)
+                    if (!request.storedPassword) typedSignedIn = true
                     // The JWT pair is stashed AFTER the drop decision below, so
                     // the warmup coordinator picks up the refresh token on the
                     // next app foreground and bearer-mode calls don't re-login
@@ -957,10 +992,28 @@ class PlaylistRepository @Inject constructor(
                 resolvedApiKey?.takeIf { it.isNotBlank() }?.let { key ->
                     enterStage(SaveStage.VerifyingCredentials)
                     dispatcharrClient.verifyConnection(normalisedBase, key)
+                    if (suppliedKey != null && key.trim() == suppliedKey && !request.storedApiKey) typedSignedIn = true
                 }
             }
             Log.i(TAG_CAPS, "credentials verified for ${playlistId.take(8)}; dropping the old account's cached identity")
             dropCachedIdentity(priorRow!!)
+        }
+        // A password or key the user typed signed in at this address: the
+        // address is theirs (StoredSecrets), before anything here can hold
+        // the key for another account's answer.
+        if (typedSignedIn && existingId != null && isDispatcharrSource) profileManager.get().noteTypedSignIn(existingId)
+        // Nothing typed, and an address not proven the same server: the
+        // playlist's own saved key goes there (the user saved the address),
+        // and must answer as the account recorded before the change, before
+        // any channel or permission of whoever answers is loaded here.
+        if (priorRow != null && isDispatcharrSource && !typedSignedIn &&
+            !com.aeriotv.android.core.profiles.StoredSecrets.mayUse(priorRow.id, normalisedBase)
+        ) {
+            val own = priorRow.apiKey?.trim()?.takeIf { it.isNotEmpty() }
+            resolvedApiKey?.trim()?.takeIf { it.isNotEmpty() && it == own }?.let { key ->
+                enterStage(SaveStage.VerifyingCredentials)
+                requireOwnAccountAtNewAddress(priorRow.id, normalisedBase, key, suppliedUser ?: priorRow.username)
+            }
         }
         // A new host, scheme, or port on either route: drop what was learned
         // against the old host BEFORE the new JWT pair lands (the drop clears
@@ -1289,7 +1342,8 @@ class PlaylistRepository @Inject constructor(
         val newBase = incoming.url.trimEnd('/')
         if (!hostChanged(before.urlString, newBase, before.lanUrlString, incoming.lanUrl)) return incoming to false
         val profiles = profileManager.get()
-        if (!profiles.holdSignInsForRouteChange(id, before.urlString, before.lanUrlString, newBase, incoming.lanUrl)) return incoming to true
+        val dispatcharr = incoming.sourceType == SourceType.DispatcharrApiKey || incoming.sourceType == SourceType.DispatcharrUserPass
+        if (!profiles.holdSignInsForRouteChange(id, before.urlString, before.lanUrlString, newBase, incoming.lanUrl, dispatcharr)) return incoming to true
         val own = kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) { dao.byId(id) } ?: before
         val signIn = com.aeriotv.android.core.profiles.ProfileHostHold.scrub(
             com.aeriotv.android.core.profiles.ProfileHostHold.SignIn(incoming.apiKey, incoming.username, incoming.password),
@@ -1297,6 +1351,28 @@ class PlaylistRepository @Inject constructor(
             profiles.heldSignIns(id),
         )
         return incoming.copy(apiKey = signIn.apiKey, username = signIn.username, password = signIn.password) to true
+    }
+
+    /**
+     * A save to an address not proven the same server with no typed secret
+     * (StoredSecrets): users/me with the playlist's own key [key] at [base]
+     * must answer as the account recorded before the change (same user id
+     * and username), or, with none recorded, as [username]. Anything else,
+     * no answer included, needs the password typed there.
+     */
+    private suspend fun requireOwnAccountAtNewAddress(playlistId: String, base: String, key: String, username: String?) {
+        val refused = com.aeriotv.android.core.profiles.StoredSecrets.Refused(
+            com.aeriotv.android.core.profiles.StoredSecrets.TYPE_PASSWORD_AT_NEW_ADDRESS,
+        )
+        val me = runCatching { dispatcharrClient.fetchMe(base, key, keyCheck = true) }.getOrNull() ?: throw refused
+        val answer = com.aeriotv.android.core.profiles.ProfileHostHold.Identity(me.id, me.username)
+        if (!com.aeriotv.android.core.profiles.StoredSecrets.answersAsOwnAccount(
+                profileManager.get().recordedDefaultIdentity(playlistId), username, answer,
+            )
+        ) {
+            Log.i(TAG_SAVE, "[PROFILE-HOST] save to a new address refused for ${playlistId.take(8)}: another account answers there")
+            throw refused
+        }
     }
 
     /**
@@ -1408,6 +1484,13 @@ class PlaylistRepository @Inject constructor(
             val key = if (request.sourceType == SourceType.DispatcharrUserPass && typedKey == null) {
                 val user = typed.username?.trim()?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("Username is required")
                 val pass = typed.password?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("Password is required")
+                // The saved password the form showed goes only to a proven address (StoredSecrets).
+                if (request.storedPassword && !com.aeriotv.android.core.profiles.StoredSecrets.check(
+                        playlistId, base, com.aeriotv.android.core.profiles.StoredSecrets.Path.EditPlaylistSignIn,
+                    )
+                ) {
+                    throw com.aeriotv.android.core.profiles.StoredSecrets.Refused(com.aeriotv.android.core.profiles.StoredSecrets.TYPE_PASSWORD_AT_NEW_ADDRESS)
+                }
                 val jwt = dispatcharrClient.login(base, user, pass)
                 dispatcharrClient.fetchCurrentUserApiKey(base, jwt.access)
             } else {
@@ -1415,7 +1498,7 @@ class PlaylistRepository @Inject constructor(
                 dispatcharrClient.verifyConnection(base, k)
                 k
             }
-            val me = runCatching { dispatcharrClient.fetchMe(base, key) }.getOrNull()
+            val me = runCatching { dispatcharrClient.fetchMe(base, key, keyCheck = true) }.getOrNull()
             OwnSignIn(com.aeriotv.android.core.profiles.EditPlaylistSignIn.ownAfter(typed, key, own), base, me)
         }
 
@@ -1484,46 +1567,43 @@ class PlaylistRepository @Inject constructor(
         // while a gated surface (DVR / On Demand) can fire its own within the
         // same second; without this the server saw two identical probes and the
         // log printed two "probe OK" lines. Late callers join the running pass
-        // instead of starting a second one.
-        val pending = CompletableDeferred<Boolean>()
-        val running = inFlightCapabilityProbes.putIfAbsent(playlistId, pending)
-        if (running != null) return running.await()
+        // instead of starting a second one. A probe asked for from inside the
+        // pass itself gets false at once (see [SingleFlight]).
+        return inFlightCapabilityProbes.single(
+            playlistId,
+            reentered = {
+                Log.w(TAG_PERMS, "probe asked from inside its own pass trigger=$trigger; the running pass answers")
+                false
+            },
+        ) { capabilityProbePass(playlistId, force, trigger) }
+    }
+
+    private suspend fun capabilityProbePass(playlistId: String, force: Boolean, trigger: String): Boolean {
         // Back-to-back passes (Streamer 2026-10-27 14:25:42: "playlist refresh"
         // at .068 and "cold launch" at .779, two probe OK and two PermsRefresh
         // lines): a pass that SUCCEEDED within [PROBE_COALESCE_MS] already
         // answered, so a later trigger reuses it instead of re-reading.
         val okAt = lastCapabilityProbeOkAt[playlistId] ?: 0L
         if (System.currentTimeMillis() - okAt < PROBE_COALESCE_MS) {
-            inFlightCapabilityProbes.remove(playlistId, pending)
-            pending.complete(true)
             Log.i(TAG_PERMS, "probe coalesced trigger=$trigger (last pass ${System.currentTimeMillis() - okAt}ms ago)")
             return true
         }
-        return try {
-            val before = dao.byId(playlistId)
-            val oldLevel = before?.permsLevelLabel() ?: "unknown"
-            val willProbe = before != null && before.isDispatcharrDirectConnect() &&
-                (force || before.capabilitiesNeedProbe())
-            if (willProbe) lastCapabilityProbeAt[playlistId] = System.currentTimeMillis()
-            val result = probeCapabilitiesUncoalesced(playlistId, force)
-            if (willProbe && result) lastCapabilityProbeOkAt[playlistId] = System.currentTimeMillis()
-            if (willProbe) {
-                val newLevel = dao.byId(playlistId)?.permsLevelLabel() ?: "unknown"
-                Log.i(
-                    TAG_PERMS,
-                    "level $oldLevel -> $newLevel trigger=$trigger" +
-                        if (result) "" else " (refresh failed, kept last good)",
-                )
-            }
-            pending.complete(result)
-            result
-        } catch (t: Throwable) {
-            // Includes cancellation: joiners must never hang on a dropped pass.
-            pending.complete(false)
-            throw t
-        } finally {
-            inFlightCapabilityProbes.remove(playlistId, pending)
+        val before = dao.byId(playlistId)
+        val oldLevel = before?.permsLevelLabel() ?: "unknown"
+        val willProbe = before != null && before.isDispatcharrDirectConnect() &&
+            (force || before.capabilitiesNeedProbe())
+        if (willProbe) lastCapabilityProbeAt[playlistId] = System.currentTimeMillis()
+        val result = probeCapabilitiesUncoalesced(playlistId, force)
+        if (willProbe && result) lastCapabilityProbeOkAt[playlistId] = System.currentTimeMillis()
+        if (willProbe) {
+            val newLevel = dao.byId(playlistId)?.permsLevelLabel() ?: "unknown"
+            Log.i(
+                TAG_PERMS,
+                "level $oldLevel -> $newLevel trigger=$trigger" +
+                    if (result) "" else " (refresh failed, kept last good)",
+            )
         }
+        return result
     }
 
     private suspend fun probeCapabilitiesUncoalesced(playlistId: String, force: Boolean): Boolean {
@@ -1553,8 +1633,15 @@ class PlaylistRepository @Inject constructor(
         }
         // The default profile's users/me (another profile's key is ignored
         // there): recorded, or the same-server check after an address change.
-        usedKey?.let { k ->
-            runCatching { profileManager.get().noteDefaultMe(playlist.id, base, k, snapshot.userId, snapshot.username) }
+        val keyHeld = usedKey?.let { k ->
+            runCatching { profileManager.get().noteDefaultMe(playlist.id, base, k, snapshot.userId, snapshot.username) }.getOrDefault(false)
+        } ?: false
+        if (keyHeld) {
+            // Another account answers at the playlist's unproven address
+            // (StoredSecrets): its key is held now, and that account's
+            // permissions are not applied here.
+            Log.w(TAG_CAPS, "probe for ${playlistId.take(8)}: another account answers at the unproven address; its answers are not applied")
+            return false
         }
         // SELF-HEAL: does the stored key actually authenticate as the account
         // whose username this playlist carries?
@@ -1697,6 +1784,17 @@ class PlaylistRepository @Inject constructor(
         val actual = serverUsername.trim().lowercase()
         if (typed.isEmpty() || actual.isEmpty() || typed == actual) return false
 
+        // Only where the server is proven the same (StoredSecrets): at an
+        // unproven or different address the repair would sign in there with
+        // the saved password. The key is held instead (the sign-in form), and
+        // the caller drops this payload, another account's.
+        if (!com.aeriotv.android.core.profiles.StoredSecrets.check(
+                playlist.id, playlist.urlString, com.aeriotv.android.core.profiles.StoredSecrets.Path.IdentityRepair,
+            )
+        ) {
+            runCatching { profileManager.get().holdOwnKeyForUnprovenRoute(playlist.id) }
+            return true
+        }
         if (!identityRepaired.add(playlist.id)) {
             Log.w(
                 TAG_CAPS,
@@ -1731,8 +1829,17 @@ class PlaylistRepository @Inject constructor(
         // identity. The Movies / TV Shows and DVR caches key on the api_key
         // as well, so the fresh key misses them and they rebuild on their
         // own.
-        runCatching { dao.byId(playlist.id)?.let { refresh(it) } }
-            .onFailure { Log.w(TAG_CAPS, "post-repair channel reload failed", it) }
+        //
+        // Launched, never awaited here (stuck save 2026-11-12): the reload
+        // probes permissions first, and run inline that probe joined this
+        // very pass, which was waiting on the reload, so the Edit Playlist
+        // save that started the pass never finished. Launched outside the
+        // pass, its probe joins this pass and goes on once it ends, the way
+        // the Apple app reloads after a repair.
+        layeringScope.launch(DeletedPlaylists.started(playlist.id)) {
+            runCatching { dao.byId(playlist.id)?.let { refresh(it) } }
+                .onFailure { Log.w(TAG_CAPS, "post-repair channel reload failed", it) }
+        }
         return true
     }
 
@@ -1760,8 +1867,7 @@ class PlaylistRepository @Inject constructor(
         return dao.byId(playlist.id)?.canSwitchStream() ?: false
     }
 
-    private val inFlightCapabilityProbes =
-        ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val inFlightCapabilityProbes = SingleFlight<String>()
 
     /**
      * Probe every Dispatcharr playlist.
@@ -2081,6 +2187,66 @@ class PlaylistRepository @Inject constructor(
      *  rather than downloading the same feeds twice in parallel. */
     private val layeringJobs = ConcurrentHashMap<String, Job>()
 
+    /** What [layeringJobs] holds per playlist (walk or layering) and how to start it again. */
+    private val layeringRestart = ConcurrentHashMap<String, Pair<String, () -> Unit>>()
+
+    /**
+     * Long-running guide jobs across a server address change (Apple cdfab66;
+     * Nothing Phone 2026-11-13: the re-sweep kept paging the OLD address after
+     * Edit Playlist moved the playlist, carrying the NEW server's key). Each
+     * request checks [routeGuard] right before it goes out; the jobs stop when
+     * a change starts, wait while it runs, and start again once it lands.
+     */
+    private val routeGuard = RouteGuard(
+        isChanging = { id -> runCatching { profileManager.get().isRouteChanging(id) }.getOrDefault(false) },
+        addresses = { id -> dao.byId(id)?.let { it.urlString to it.lanUrlString } },
+    )
+    private val routeJobs = RouteChangeJobs()
+
+    private fun routeChanging(playlistId: String): Boolean =
+        runCatching { profileManager.get().isRouteChanging(playlistId) }.getOrDefault(false)
+
+    /** True when [kind] for [playlistId] waits for an address change to land (then [start] runs). */
+    private fun holdForRouteChange(playlistId: String, kind: String, start: () -> Unit): Boolean {
+        if (!routeJobs.hold(playlistId, routeChanging(playlistId), kind, start)) return false
+        Log.i("PlaylistRepo", "[EPG] $kind for ${playlistId.take(8)} waits: its server address is changing")
+        return true
+    }
+
+    /** withApiKeyRetry for a long-running job: [base] must still be the playlist's own address. */
+    private suspend fun <T> withKeyAtRoute(playlistId: String, base: String, job: String, block: suspend (String) -> T): T =
+        dispatcharrAuth.withApiKeyRetry(playlistId) { key ->
+            try {
+                routeGuard.ensure(playlistId, base, job)
+            } catch (e: RouteMoved) {
+                Log.i("PlaylistRepo", "[EPG] ${e.message}")
+                throw e
+            }
+            block(key)
+        }
+
+    private fun onRouteChange(playlistId: String, landed: Boolean) {
+        val id8 = playlistId.take(8)
+        val runningKinds = buildSet {
+            if (epgSweepJobs[playlistId]?.isActive == true) add(RouteChangeJobs.SWEEP)
+            if (layeringJobs[playlistId]?.isActive == true) layeringRestart[playlistId]?.first?.let(::add)
+        }
+        if (!landed) {
+            val running = buildMap<String, () -> Unit> {
+                if (RouteChangeJobs.SWEEP in runningKinds) put(RouteChangeJobs.SWEEP) { startEpgBackgroundSweep(playlistId) }
+                layeringRestart[playlistId]?.takeIf { it.first in runningKinds }?.let { put(it.first, it.second) }
+            }
+            val stop = routeJobs.onStart(playlistId, running)
+            if (RouteChangeJobs.SWEEP in stop) epgSweepJobs.remove(playlistId)?.cancel()
+            if (stop.any { it != RouteChangeJobs.SWEEP }) layeringJobs.remove(playlistId)?.cancel()
+            if (stop.isNotEmpty()) Log.i("PlaylistRepo", "[EPG] server address changing on $id8: stopped ${stop.joinToString()} for the old address")
+        } else {
+            val start = routeJobs.onLanded(playlistId, runningKinds)
+            if (start.isNotEmpty()) Log.i("PlaylistRepo", "[EPG] server address change landed on $id8: starting ${start.joinToString { it.first }} at the current address")
+            start.forEach { (_, run) -> runCatching { run() } }
+        }
+    }
+
     private val _upstreamEpgLayered = MutableSharedFlow<String>(extraBufferCapacity = 4)
 
     /** Emits a playlistId after that playlist's upstream catch-up history has
@@ -2123,7 +2289,7 @@ class PlaylistRepository @Inject constructor(
         while (start < throughMs) {
             val end = minOf(throughMs, start + dayMs)
             val programmes = runCatching {
-                dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                withKeyAtRoute(playlist.id, base, "guide range fetch") { key ->
                     dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
                 }
             }.getOrElse {
@@ -2159,10 +2325,18 @@ class PlaylistRepository @Inject constructor(
          *  non-authoritative: each chunk is a fragment of the guide and must
          *  not delete what the neighbouring chunks put there. */
         authoritative: Boolean = false,
+        /** A long-running job's name: its request must still go to the playlist's own address. */
+        routeJob: String? = null,
     ): Int? {
         val programmes = runCatching {
-            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
-                dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
+            if (routeJob != null) {
+                withKeyAtRoute(playlist.id, base, routeJob) { key ->
+                    dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
+                }
+            } else {
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                    dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
+                }
             }
         }.getOrElse {
             if (it is CancellationException) throw it
@@ -2200,7 +2374,7 @@ class PlaylistRepository @Inject constructor(
         start: Long,
         end: Long,
     ): Int? {
-        val n = fetchGridChunk(playlist, base, start, end) ?: return null
+        val n = fetchGridChunk(playlist, base, start, end, routeJob = RouteChangeJobs.WALK) ?: return null
         DeletedPlaylists.ensureAlive(playlist.id, "EPG chunk coverage")
         runCatching {
             epgChunkCoverageDao.upsert(
@@ -2385,7 +2559,7 @@ class PlaylistRepository @Inject constructor(
         awaitGuidePainted: suspend () -> Unit,
     ) {
         if (!catchupReachPrunedAtLaunch.add(playlistId)) return
-        layeringScope.launch {
+        layeringScope.launch(DeletedPlaylists.started(playlistId)) {
             awaitGuidePainted()
             runCatching { pruneEpgBeyondCatchupReach(playlistId) }
                 .onFailure { Log.w("PlaylistRepo", "[EPG] launch catch-up reach prune failed", it) }
@@ -2437,6 +2611,16 @@ class PlaylistRepository @Inject constructor(
      *  walking reuses it instead of double-fetching every chunk. */
     private val epgSweepJobs = ConcurrentHashMap<String, Job>()
 
+    init {
+        // Address changes stop, hold, and restart the guide jobs (routeJobs).
+        // Here, after every field it touches is set, and from a coroutine so
+        // ProfileManager (which needs this repository) is never asked for
+        // while either is being built.
+        layeringScope.launch {
+            profileManager.get().routeChanges.collect { change -> onRouteChange(change.playlistId, change.landed) }
+        }
+    }
+
     /**
      * What a background sweep has to do: the server state to remember once it
      * completes, and which channels it may write.
@@ -2472,7 +2656,7 @@ class PlaylistRepository @Inject constructor(
         base: String,
     ): EpgSweepPlan? {
         val sources = runCatching {
-            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            withKeyAtRoute(playlist.id, base, RouteChangeJobs.SWEEP) { key ->
                 dispatcharrClient.listEpgSources(base, key)
             }
         }.getOrElse {
@@ -2525,7 +2709,7 @@ class PlaylistRepository @Inject constructor(
      */
     private suspend fun epgKeysForSources(playlist: PlaylistEntity, base: String, sourceIds: Set<Int>): Set<String>? {
         val rows = runCatching {
-            dispatcharrAuth.withApiKeyRetry(playlist.id) { key -> dispatcharrClient.listEpgData(base, key) }
+            withKeyAtRoute(playlist.id, base, RouteChangeJobs.SWEEP) { key -> dispatcharrClient.listEpgData(base, key) }
         }.getOrElse {
             if (it is CancellationException) throw it
             Log.w("PlaylistRepo", "[EPG] epgdata unreadable; sweep waits for the next gate: $it")
@@ -2577,7 +2761,7 @@ class PlaylistRepository @Inject constructor(
     ): Int? {
         val t0 = android.os.SystemClock.elapsedRealtime()
         val programmes = runCatching {
-            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            withKeyAtRoute(playlist.id, base, RouteChangeJobs.SWEEP) { key ->
                 dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
             }
         }.getOrElse {
@@ -2670,9 +2854,10 @@ class PlaylistRepository @Inject constructor(
      * two threads), the one-at-a-time pacing, and the inter-chunk gap.
      */
     fun startEpgBackgroundSweep(playlistId: String) {
+        if (holdForRouteChange(playlistId, RouteChangeJobs.SWEEP) { startEpgBackgroundSweep(playlistId) }) return
         epgSweepJobs.compute(playlistId) { _, existing ->
             if (existing?.isActive == true) return@compute existing
-            layeringScope.launch {
+            layeringScope.launch(DeletedPlaylists.started(playlistId)) {
                 // Settle window: the guide paints from cache, the cold-launch
                 // channel load finishes, and a tune started from the launch
                 // screen reaches its first frame before we touch the network.
@@ -2809,9 +2994,17 @@ class PlaylistRepository @Inject constructor(
         base: String,
         liveProgrammeCount: Int,
     ) {
+        val restart: () -> Unit = {
+            layeringScope.launch(DeletedPlaylists.started(playlist.id)) {
+                val row = dao.byId(playlist.id) ?: return@launch
+                extendGridWindowInBackground(row, effectiveBaseUrl(row), liveProgrammeCount)
+            }
+        }
+        if (holdForRouteChange(playlist.id, RouteChangeJobs.WALK, restart)) return
         layeringJobs.compute(playlist.id) { _, existing ->
             if (existing?.isActive == true) return@compute existing
-            layeringScope.launch {
+            layeringRestart[playlist.id] = RouteChangeJobs.WALK to restart
+            layeringScope.launch(DeletedPlaylists.started(playlist.id)) {
                 val now = System.currentTimeMillis()
                 val dayMs = 86_400_000L
                 // Logan 2026-09-11: the playlist's Guide Days setting
@@ -2975,15 +3168,23 @@ class PlaylistRepository @Inject constructor(
         customXmltvUrl: String?,
         knownChannelKeys: Set<String>?,
     ) {
+        val restart: () -> Unit = {
+            layeringScope.launch(DeletedPlaylists.started(playlistId)) {
+                val row = dao.byId(playlistId) ?: return@launch
+                layerUpstreamInBackground(playlistId, effectiveBaseUrl(row), customXmltvUrl, knownChannelKeys)
+            }
+        }
+        if (holdForRouteChange(playlistId, RouteChangeJobs.LAYERING, restart)) return
         layeringJobs.compute(playlistId) { _, existing ->
             if (existing?.isActive == true) return@compute existing
-            layeringScope.launch {
+            layeringRestart[playlistId] = RouteChangeJobs.LAYERING to restart
+            layeringScope.launch(DeletedPlaylists.started(playlistId)) {
                 // GH #53: source discovery moved in here with the fetching. It
                 // needs /api/epg/epgdata/ as well as /api/epg/sources/ now (to
                 // learn which feed each tvg-id came from), and neither belongs
                 // in front of the guide paint.
                 val layers = runCatching {
-                    dispatcharrAuth.withApiKeyRetry(playlistId) { key ->
+                    withKeyAtRoute(playlistId, base, RouteChangeJobs.LAYERING) { key ->
                         dispatcharrEpgLayers(
                             epgData = dispatcharrClient.listEpgData(base, key),
                             sources = dispatcharrClient.listEpgSources(base, key),
@@ -3338,7 +3539,7 @@ class PlaylistRepository @Inject constructor(
                     // IF the server's EPG sources moved since this cache was
                     // built; the fingerprint is only that gate. Rate limited
                     // inside, so a second guide load is free.
-                    layeringScope.launch { maybeSweepEpgForSourceChanges(playlist.id) }
+                    layeringScope.launch(DeletedPlaylists.started(playlist.id)) { maybeSweepEpgForSourceChanges(playlist.id) }
                 } else {
                     layerUpstreamInBackground(playlist.id, base, customXmltv, knownChannelKeys)
                 }
@@ -3588,10 +3789,6 @@ class PlaylistRepository @Inject constructor(
     ) {
         val now = System.currentTimeMillis()
         val history = epgHistoryWindow(playlistId, now)
-        val entities = withContext(layeringDispatcher) {
-            programmes.map { it.toCacheEntity(playlistId, now) }
-                .insideHistory(history, { it.channelId }, { it.endMillis })
-        }
         DeletedPlaylists.ensureAlive(playlistId, "EPG cache")
         // Catch-up (task #135): MERGE the feed instead of replacing the whole
         // cache, so already-aired rows survive refreshes and accumulate into a
@@ -3599,12 +3796,35 @@ class PlaylistRepository @Inject constructor(
         // (default 7 days). The old behaviour (full replace + drop everything
         // ended over an hour ago) erased exactly the programmes the catch-up
         // "Watch" action needs.
-        epgProgrammeDao.mergeForPlaylist(
-            playlistId,
-            entities,
-            now,
-            replaceCoveredWindow = authoritative,
-        )
+        //
+        // Batched like the channel snapshot (Apple 6ae3fdd: about 10k rows per
+        // batch): the whole window used to become one list of cache rows,
+        // filtered into a second, and bound into one insert, so the save's
+        // peak grew with the guide (150k programmes on a large lineup). Now
+        // only one batch of rows exists at a time, whole channels per batch
+        // (the merge's per-channel delete must see all of a channel's rows),
+        // inside ONE transaction so a reader never sees a half-merged guide.
+        val started = android.os.SystemClock.elapsedRealtime()
+        val batches = EpgSaveBatches.byChannel(programmes) { it.channelId }
+        database.withTransaction {
+            for (batch in batches) {
+                val entities = batch.map { it.toCacheEntity(playlistId, now) }
+                    .insideHistory(history, { it.channelId }, { it.endMillis })
+                epgProgrammeDao.mergeForPlaylist(
+                    playlistId,
+                    entities,
+                    now,
+                    replaceCoveredWindow = authoritative,
+                )
+            }
+        }
+        if (batches.size > 1) {
+            Log.i(
+                "PlaylistRepo",
+                "[EPG] cache save: ${programmes.size} programmes in ${batches.size} batches, " +
+                    "${android.os.SystemClock.elapsedRealtime() - started} ms",
+            )
+        }
         // E-6: prune at most once per cycle. Upstream layering calls this once
         // PER SOURCE on purpose (so a kill mid-phase loses at most one feed),
         // and every one of those calls used to run a full-table retention
@@ -3745,7 +3965,7 @@ class PlaylistRepository @Inject constructor(
         // stays clean and reloads never feed a duplicate key to the url-keyed
         // Live TV lists. Distinct streams that share a tvg-id are kept.
         val channels = rawChannels.distinctBy { it.url }
-        DeletedPlaylists.ensureAlive(playlistId, "channel snapshot")
+        DeletedPlaylists.ensureAlive(playlistId, "channel snapshot", binding.instance)
         // GH #31: persist in CHUNKS inside ONE transaction instead of mapping the
         // whole ~100k-row entity list + one giant insertAll. That overlap (the
         // channel list + the full entity list + the transaction bind) was the
@@ -3782,6 +4002,15 @@ class PlaylistRepository @Inject constructor(
             if (binding.isDefaultProfile) dao.updateChannelCount(playlistId, channels.size)
         }
         stampSnapshot(playlistId, binding)
+        // Reminders kept from a deleted playlist come back on this one when it
+        // has their channel, and this playlist's own reminders get their
+        // alarms back after it was re-added (ReminderVisibility).
+        runCatching {
+            val back = com.aeriotv.android.feature.reminders.ReminderAlarms.restoreForPlaylist(
+                context, database.reminderDao(), playlistId, channels.mapTo(HashSet()) { it.name },
+            )
+            if (back > 0) Log.i("PlaylistRepo", "[REMINDER] $back reminder(s) back on ${playlistId.take(8)}: it has their channel")
+        }.onFailure { Log.w("PlaylistRepo", "reminder restore failed", it) }
     }
 
     /**
@@ -4173,7 +4402,25 @@ class PlaylistRepository @Inject constructor(
      * the cleanup that used to be implicit has to be explicit here or the
      * rows would outlive the playlist forever.
      */
-    suspend fun deletePlaylist(playlistId: String): Result<Unit> = runCatching {
+    /**
+     * On-device recordings that came from [playlistId] (local captures and
+     * Save to Device copies, every profile): the delete prompt's count.
+     */
+    suspend fun onDeviceRecordingCount(playlistId: String): Int =
+        runCatching { database.localRecordingDao().allForPlaylist(playlistId).size }.getOrDefault(0)
+
+    /**
+     * Delete [playlistId] from this device (playlist delete cutoff, Logan
+     * 2026-11-12: "If the playlist is deleted then the app should no longer
+     * have access to anything within that playlist. Immediately."). Nothing
+     * is ever sent to the server for it: no server recording or rule is
+     * cancelled, stopped, or deleted.
+     *
+     * [keepRecordings]: its on-device recordings stay as "Saved on this
+     * device" (no playlist, played from the file); false deletes their files
+     * and rows. Every caller but the delete prompt keeps them.
+     */
+    suspend fun deletePlaylist(playlistId: String, keepRecordings: Boolean = true): Result<Unit> = runCatching {
         // Crash guard (Apple d051505 parity): mark the id deleted and stop
         // every background task that holds it BEFORE anything is purged, so
         // none of them writes rows for this playlist after its next
@@ -4197,6 +4444,14 @@ class PlaylistRepository @Inject constructor(
         // The VOD snapshot file is keyed by the playlist's IDENTITY, which is
         // derived from the row, so compute it BEFORE the row is gone.
         val row = dao.byId(playlistId)
+        cutOffPlaylist(playlistId, row, keepRecordings)
+        // The row goes first (Apple performServerCascadeDelete parity): the
+        // Settings list observes it, so the playlist disappears at once
+        // instead of after the purges below, which took about 6 s on a phone
+        // (2026-11-12). Reminders, watch progress and local recordings are
+        // ON DELETE CASCADE against this row, so the DAO delete takes them
+        // with it. The stores below are keyed by the id string alone.
+        dao.deleteById(playlistId)
         // Guide + coverage, channel snapshot, VOD catalog (all identities),
         // VOD snapshot metadata file. Each is best-effort: a failure to clean
         // one store must not abort the delete itself.
@@ -4210,9 +4465,49 @@ class PlaylistRepository @Inject constructor(
             runCatching { vodSnapshotStore.delete(vodSnapshotStore.identity(row)) }
                 .onFailure { Log.w("PlaylistRepo", "delete: VOD snapshot purge failed", it) }
         }
-        // Reminders, watch progress and local recordings are ON DELETE
-        // CASCADE against this row, so the DAO delete takes them with it.
-        dao.deleteById(playlistId)
+    }
+
+    /**
+     * The parts of a playlist delete that make it unreachable at once, before
+     * its row goes:
+     * - its sign-ins: the playlist's own key and its profiles' keys are
+     *   refused at the request gate (every API call, stream, and logo), unless
+     *   another playlist here still uses the same key; its profiles and their
+     *   stored sign-ins are removed; its held-key prompt and re-checks end;
+     * - its reminders stay, with their alarms cancelled (ReminderVisibility);
+     * - its on-device recordings are kept as "Saved on this device" or
+     *   deleted, as the user chose.
+     */
+    private suspend fun cutOffPlaylist(playlistId: String, row: PlaylistEntity?, keepRecordings: Boolean) {
+        val profiles = profileManager.get()
+        // The playlist's own key (the raw row), and the active profile's when one is overlaid.
+        val own = runCatching { withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) { dao.byId(playlistId) } }.getOrNull()
+        val keys = (listOfNotNull(own?.apiKey?.trim()?.takeIf { it.isNotEmpty() }, row?.apiKey?.trim()?.takeIf { it.isNotEmpty() }) +
+            runCatching { profiles.forgetPlaylistProfiles(playlistId) }.getOrDefault(emptyList())).toSet()
+        val others = runCatching { dao.allOnce() }.getOrDefault(emptyList()).filter { it.id != playlistId }
+        val stillUsed = keys.filter { k -> others.any { it.apiKey?.trim() == k } || profiles.usesKey(k) }.toSet()
+        (keys - stillUsed).forEach { com.aeriotv.android.core.network.DispatcharrRequestGate.markDeleted(it) }
+        com.aeriotv.android.core.network.DispatcharrRequestGate.clearPlaylist(playlistId)
+        val reminders = runCatching {
+            com.aeriotv.android.feature.reminders.ReminderAlarms.suspendForPlaylist(context, database.reminderDao(), playlistId)
+        }.getOrDefault(0)
+        val recDao = database.localRecordingDao()
+        val recordings = runCatching {
+            if (keepRecordings) {
+                recDao.detachPlaylist(playlistId)
+            } else {
+                val rows = recDao.allForPlaylist(playlistId)
+                rows.forEach { com.aeriotv.android.core.data.LocalRecordingFiles.delete(context, it.filePath) }
+                recDao.deleteForPlaylist(playlistId)
+                rows.size
+            }
+        }.getOrDefault(0)
+        Log.i(
+            "PlaylistRepo",
+            "[PLAYLIST] delete ${playlistId.take(8)}: ${keys.size - stillUsed.size} sign-in key(s) refused from now on, " +
+                "$reminders reminder(s) kept with alarms cancelled, $recordings on-device recording(s) " +
+                if (keepRecordings) "kept as Saved on this device" else "deleted",
+        )
     }
 
     /**

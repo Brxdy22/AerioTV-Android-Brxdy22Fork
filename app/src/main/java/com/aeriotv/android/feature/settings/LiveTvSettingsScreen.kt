@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -56,9 +57,7 @@ import com.aeriotv.android.core.category.CategoryPaletteState
 import com.aeriotv.android.core.category.ProgramCategory
 import com.aeriotv.android.ui.adaptive.LocalTabBarBottomInset
 import com.aeriotv.android.core.preferences.GuideProgramInfoButton
-import com.aeriotv.android.ui.scale.AlertDialog
 import com.aeriotv.android.ui.settings.SettingsActionRow
-import com.aeriotv.android.ui.settings.SettingsDialogTextButton
 import com.aeriotv.android.ui.settings.SettingsDetailTopBar
 import com.aeriotv.android.ui.settings.SettingsPickerOption
 import com.aeriotv.android.ui.settings.SettingsPickerRow
@@ -126,16 +125,31 @@ fun LiveTvSettingsScreen(
         SettingsDetailTopBar(title = "Live TV", onBack = onBack)
 
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+            val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
             LazyColumn(
-                modifier = Modifier.settingsFormWidth(),
+                state = paneList,
+                modifier = Modifier.settingsFormWidth().settingsPaneTopEdge(paneList),
                 contentPadding = PaddingValues(
                     start = 16.dp,
                     end = 16.dp,
                     top = 12.dp,
                     bottom = LocalTabBarBottomInset.current,
                 ),
-                verticalArrangement = Arrangement.spacedBy(20.dp),
+                verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
             ) {
+                // Recently Watched, placed per form factor below.
+                fun androidx.compose.foundation.lazy.LazyListScope.recentlyWatched() {
+                    if (com.aeriotv.android.core.profiles.ProfileRoles.active.value != com.aeriotv.android.core.profiles.ProfileRole.Child) item("recently-watched") {
+                        SettingsSection(header = "Recently Watched") {
+                            SettingsActionRow(
+                                label = "Clear Recently Watched",
+                                leadingIcon = Icons.Filled.History,
+                                destructive = true,
+                                onClick = { confirmClearRecents = true },
+                            )
+                        }
+                    }
+                }
                 // MARK: Guide Presentation
                 //
                 // Copy is Apple's word for word. `listViewShown` stands in
@@ -363,16 +377,13 @@ fun LiveTvSettingsScreen(
                                 selected = if (phoneGroupSelector == "pills") "pills" else "sidebar",
                                 onSelect = viewModel::setPhoneGroupSelector,
                             )
-                        }
-                        // Apple issue #102 parity: only with Sidebar Menu.
-                        if (phoneGroupSelector != "pills") {
-                            SettingsSection(
-                                header = "",
-                                footer = "A swipe in from the left edge opens the group sidebar. " +
-                                    "Swiping left or right to change groups is off while this is on.",
-                            ) {
+                            // Apple issue #102 parity: only with Sidebar Menu,
+                            // in the Group Selection section as on iOS.
+                            if (phoneGroupSelector != "pills") {
                                 SettingsToggleRow(
                                     title = "Swipe from Left Edge Opens Sidebar",
+                                    subtitle = "A swipe in from the left edge opens the group sidebar. " +
+                                        "Swiping left or right to change groups is off while this is on.",
                                     checked = edgeSwipeOpensSidebar,
                                     onCheckedChange = viewModel::setLiveTvEdgeSwipeOpensSidebar,
                                 )
@@ -428,6 +439,10 @@ fun LiveTvSettingsScreen(
                         }
                     }
                 }
+
+                // Apple: Recently Watched between Badges and Display Scale
+                // (iOS and tvOS).
+                recentlyWatched()
 
                 // MARK: Display Scale
                 settingsCard(
@@ -512,13 +527,23 @@ fun LiveTvSettingsScreen(
                         }
                     }
                     DividerRow()
+                    // iOS: Add more categories, then Reset Colors to Defaults.
+                    Box(modifier = Modifier.alpha(if (palette.masterEnabled) 1f else 0.4f)) {
+                        AddMoreCategoriesRow(
+                            extraOn = ProgramCategory.additionalBuckets.count { palette.isBucketEnabled(it) },
+                            customCount = palette.custom.size,
+                            enabled = palette.masterEnabled,
+                            onClick = onOpenAddMoreCategories,
+                        )
+                    }
+                    DividerRow()
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .settingsRowFocusCard()
                             .clickable(enabled = palette.masterEnabled) { viewModel.resetCategoryPalette() }
                             .alpha(if (palette.masterEnabled) 1f else 0.4f)
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
@@ -531,28 +556,8 @@ fun LiveTvSettingsScreen(
                             fontWeight = FontWeight.Medium,
                         )
                     }
-                    DividerRow()
-                    Box(modifier = Modifier.alpha(if (palette.masterEnabled) 1f else 0.4f)) {
-                        AddMoreCategoriesRow(
-                            extraOn = ProgramCategory.additionalBuckets.count { palette.isBucketEnabled(it) },
-                            customCount = palette.custom.size,
-                            enabled = palette.masterEnabled,
-                            onClick = onOpenAddMoreCategories,
-                        )
-                    }
                 }
 
-                // MARK: Recently Watched (GH #130, Apple 5e34cf6)
-                if (com.aeriotv.android.core.profiles.ProfileRoles.active.value != com.aeriotv.android.core.profiles.ProfileRole.Child) item("recently-watched") {
-                    SettingsSection(header = "Recently Watched") {
-                        SettingsActionRow(
-                            label = "Clear Recently Watched",
-                            leadingIcon = Icons.Filled.History,
-                            destructive = true,
-                            onClick = { confirmClearRecents = true },
-                        )
-                    }
-                }
             }
         }
     }
@@ -560,23 +565,17 @@ fun LiveTvSettingsScreen(
     }
 
     if (confirmClearRecents) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { confirmClearRecents = false },
-            title = { Text("Clear Recently Watched?") },
-            text = { Text("Removes every channel from Recently Watched.") },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Clear",
-                    destructive = true,
-                    onClick = {
-                        confirmClearRecents = false
-                        viewModel.clearRecentChannels()
-                    },
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { confirmClearRecents = false })
-            },
+            title = "Clear Recently Watched?",
+            message = "Removes every channel from Recently Watched.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Clear", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    confirmClearRecents = false
+                    viewModel.clearRecentChannels()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { confirmClearRecents = false },
+            ),
         )
     }
 

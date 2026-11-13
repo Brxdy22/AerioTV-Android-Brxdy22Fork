@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.update
@@ -99,6 +100,13 @@ class DvrViewModel @Inject constructor(
          */
         val playbackUrl: String? = null,
         /**
+         * An on-device recording whose playlist was deleted with "Delete,
+         * Keep Recordings" (or one from before playlist ids): it belongs to
+         * no playlist, shows in "Saved on this device" under every playlist,
+         * and plays from its file only.
+         */
+        val savedOnDevice: Boolean = false,
+        /**
          * Dispatcharr channel id this recording is for (audit task #50
          * watch-live). Populated on server recordings from the
          * Dispatcharr API response; null on local recordings (the source
@@ -143,6 +151,14 @@ class DvrViewModel @Inject constructor(
         val backdropUrl: String? = null,
         /** Dispatcharr "interrupted": a partial file. tvOS badges only this, never a user stop. */
         val partial: Boolean = false,
+        /** Why an on-device recording failed (Apple's wording), shown in its details. */
+        val failureReason: String? = null,
+        /**
+         * A finished on-device recording whose file is not there (removed
+         * outside the app): badged "Missing", "File missing" in its
+         * details, no Play, still deletable (Apple 743bd6b).
+         */
+        val fileMissing: Boolean = false,
         val subTitle: String? = null,
         /** The guide programme's own airing (tvOS Program Info "Airs"); the recording window is startMillis/endMillis. */
         val programStartMillis: Long? = null,
@@ -512,8 +528,26 @@ class DvrViewModel @Inject constructor(
                 }
         }
         viewModelScope.launch {
-            localRecordingDao.observeAll().collect { rows ->
-                val mapped = rows.map { it.toRecording() }
+            // The running capture's own row (written at start, marked
+            // recording) is listed by the synthetic in-progress row above;
+            // a row left recording by an earlier process is listed as is
+            // until the launch sweep finishes it (InterruptedCapture).
+            localRecordingDao.observeAll().combine(LocalRecordingService.activeRecording) { rows, active ->
+                rows.filterNot { r ->
+                    active != null && r.status == InterruptedCapture.RECORDING && r.startedAt >= active.startedAt
+                }
+            }.collect { rows ->
+                // Each finished row's file is checked where it is stored
+                // (MediaStore, a picked folder, or a path).
+                val mapped = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    rows.map { r ->
+                        r.toRecording(
+                            fileMissing = com.aeriotv.android.core.data.LocalRecordingRules.isMissing(r.status, r.filePath) { p ->
+                                com.aeriotv.android.core.data.LocalRecordingFiles.probe(appContext, p).bytes != null
+                            },
+                        )
+                    }
+                }
                 _state.update { st ->
                     // Keep the synthetic in-progress row: it is not in Room
                     // yet, and this observer would otherwise drop it on any
@@ -1058,14 +1092,31 @@ class DvrViewModel @Inject constructor(
     }
 
     /**
+     * Stop an on-device recording: the running capture stops (its row is
+     * finished with what it captured). A row still marked recording with no
+     * capture behind it (the app was killed mid-capture) is finished now,
+     * interrupted, keeping its file (Apple parity: Stop used to do nothing).
+     */
+    private suspend fun stopLocalRecording(recording: Recording): Result<Unit> = runCatching {
+        val rowId = recording.id.removePrefix("local-").toLongOrNull()
+        when {
+            recording.id == LOCAL_IN_PROGRESS_ID || (rowId != null && LocalRecordingService.isCapturingRow(rowId)) ->
+                LocalRecordingService.stop(appContext)
+            rowId != null -> {
+                Log.i(TAG, "[DVR] Stop: no capture running for on-device recording $rowId")
+                LocalRecordingRecovery.finish(appContext, localRecordingDao, rowId, "stop")
+            }
+            else -> throw IllegalStateException("Invalid local recording id: ${recording.id}")
+        }
+    }
+
+    /**
      * Stop an in-progress server recording early. The partial file stays on
      * disk, caller pairs with deleteRecording when the partial isn't wanted.
      * Mirrors iOS contextMenu "Stop Recording" (MyRecordingsView line 332-336).
      */
     suspend fun stopRecording(recording: Recording): Result<Unit> {
-        if (recording.source != Source.Server) {
-            return Result.failure(IllegalStateException("Stop Recording is server-only."))
-        }
+        if (recording.source == Source.Local) return stopLocalRecording(recording)
         val playlist = playlistRepository.activePlaylist()
             ?: return Result.failure(IllegalStateException("No playlist loaded."))
         if (playlist.apiKey.isNullOrBlank()) {
@@ -1118,17 +1169,7 @@ class DvrViewModel @Inject constructor(
      * SAF content:// URI, a file:// URI, and a bare filesystem path (the
      * app-private fallback). Best-effort; the Room row is dropped regardless.
      */
-    private fun deleteLocalFile(path: String) {
-        runCatching {
-            when {
-                path.startsWith("content://") ->
-                    appContext.contentResolver.delete(android.net.Uri.parse(path), null, null)
-                path.startsWith("file://") ->
-                    android.net.Uri.parse(path).path?.let { java.io.File(it).delete() }
-                else -> java.io.File(path).delete()
-            }
-        }
-    }
+    private fun deleteLocalFile(path: String) = com.aeriotv.android.core.data.LocalRecordingFiles.delete(appContext, path)
 
     /**
      * Fill in programme title/description for server recordings the server left
@@ -1473,11 +1514,14 @@ private fun resolveArtUrl(url: String, baseUrl: String): String {
     return base + (if (trimmed.startsWith("/")) trimmed else "/$trimmed")
 }
 
-private fun LocalRecordingEntity.toRecording(): DvrViewModel.Recording {
+private fun LocalRecordingEntity.toRecording(fileMissing: Boolean = false): DvrViewModel.Recording {
     val status = when (this.status.lowercase()) {
-        "completed" -> DvrViewModel.Recording.Status.Completed
+        // A capture cut short keeps what it captured and plays, like a
+        // server recording Dispatcharr marks interrupted.
+        "completed", InterruptedCapture.INTERRUPTED -> DvrViewModel.Recording.Status.Completed
         "stopped" -> DvrViewModel.Recording.Status.Stopped
         "failed", "error" -> DvrViewModel.Recording.Status.Failed
+        InterruptedCapture.RECORDING -> DvrViewModel.Recording.Status.Recording
         else -> DvrViewModel.Recording.Status.Unknown
     }
     // file:// URI for libmpv. Path may contain spaces / unicode (the recording
@@ -1486,7 +1530,8 @@ private fun LocalRecordingEntity.toRecording(): DvrViewModel.Recording {
     // happily resolves file:// against the filesystem when SAF isn't involved.
     val isPlayable = status == DvrViewModel.Recording.Status.Completed ||
         status == DvrViewModel.Recording.Status.Stopped
-    val playable = if (isPlayable && filePath.isNotBlank()) {
+    // A file that is gone has nothing to play (shown as missing).
+    val playable = if (isPlayable && filePath.isNotBlank() && !fileMissing) {
         // A recording saved to the public Downloads (MediaStore) or a SAF
         // custom folder is stored as a content:// URI; a path from the
         // app-private dir needs wrapping in file://. ExoPlayer's
@@ -1504,6 +1549,10 @@ private fun LocalRecordingEntity.toRecording(): DvrViewModel.Recording {
         status = status,
         fileSizeBytes = byteSize,
         playbackUrl = playable,
+        savedOnDevice = playlistId == null,
+        partial = this.status.lowercase() == InterruptedCapture.INTERRUPTED,
+        failureReason = failureReason.takeIf { status == DvrViewModel.Recording.Status.Failed },
+        fileMissing = fileMissing,
     )
 }
 

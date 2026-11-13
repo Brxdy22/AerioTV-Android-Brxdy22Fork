@@ -324,7 +324,20 @@ fun DvrTabContent(
             ),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(items = state.visible, key = { it.id }) { rec ->
+            // Recordings kept from a deleted playlist come last, under their
+            // own header (DvrSavedOnDevice).
+            items(items = DvrSavedOnDevice.rows(state.visible), key = { (it as? DvrViewModel.Recording)?.id ?: DvrSavedOnDevice.HEADER_KEY }) { entry ->
+                if (entry !is DvrViewModel.Recording) {
+                    Text(
+                        DvrSavedOnDevice.TITLE,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 12.dp, bottom = 2.dp, start = 4.dp),
+                    )
+                    return@items
+                }
+                val rec = entry
                 RecordingRow(
                     rec = rec,
                     palette = palette,
@@ -480,10 +493,10 @@ fun DvrTabContent(
     }
 
     pendingDelete?.let { rec ->
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Delete recording?") },
-            text = {
+            title = "Delete recording?",
+            content = {
                 Text(
                     "This removes \"${rec.title}\" " +
                             if (rec.source == DvrViewModel.Source.Local)
@@ -492,8 +505,8 @@ fun DvrTabContent(
                                 "from your Dispatcharr server. The file is gone after this."
                 )
             },
-            confirmButton = {
-                TextButton(onClick = {
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Delete", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
                     pendingDelete = null
                     scope.launch {
                         viewModel.deleteRecording(rec).fold(
@@ -509,11 +522,9 @@ fun DvrTabContent(
                             },
                         )
                     }
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
-            },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingDelete = null },
+            ),
         )
     }
 
@@ -521,10 +532,10 @@ fun DvrTabContent(
     // state.completedCount so the count in the prompt reflects what would
     // actually be deleted at the moment the user opens the dialog.
     if (pendingClearAll) {
-        AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingClearAll = false },
-            title = { Text("Clear all completed?") },
-            text = {
+            title = "Clear all completed?",
+            content = {
                 Text(
                     if (canManageDvr) {
                         "This removes all ${state.completedCount} completed " +
@@ -539,8 +550,8 @@ fun DvrTabContent(
                     },
                 )
             },
-            confirmButton = {
-                TextButton(onClick = {
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Delete All", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
                     pendingClearAll = false
                     scope.launch {
                         viewModel.deleteAllCompleted(includeServer = canManageDvr).fold(
@@ -560,13 +571,9 @@ fun DvrTabContent(
                             },
                         )
                     }
-                }) {
-                    Text("Delete All", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingClearAll = false }) { Text("Cancel") }
-            },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingClearAll = false },
+            ),
         )
     }
 }

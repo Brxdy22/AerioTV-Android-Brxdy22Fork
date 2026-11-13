@@ -1,5 +1,6 @@
 package com.aeriotv.android.feature.settings
 
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -14,6 +15,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
+import com.aeriotv.android.ui.settings.dpadFocusRing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -66,7 +70,7 @@ import kotlinx.coroutines.launch
 /**
  * Profiles phase 2b (2026-10-17): the Child profile's Manage Profiles row
  * and page, the TV launch picker, and the "Ask who is watching at launch"
- * toggle. Copy: "Manage Profiles", "Enter a PIN from an Admin or Standard profile", "Who is watching?".
+ * toggle. Copy: "Manage Profiles", "Enter an Admin or Standard profile PIN, or the Device Admin PIN", "Who is watching?".
  */
 
 /** Bottom of a Child's Settings root list. */
@@ -75,7 +79,7 @@ fun ManageProfilesRow(onClick: () -> Unit) {
     SettingsCard {
         SettingsNavRow(
             title = "Manage Profiles",
-            subtitle = "Switch profiles, Admin PIN",
+            subtitle = com.aeriotv.android.core.profiles.PinCopy.MANAGE_PROFILES_ROW,
             icon = Icons.Outlined.ManageAccounts,
             onClick = onClick,
         )
@@ -103,6 +107,15 @@ fun ManageProfilesPage(onBack: () -> Unit) {
     val activeId by vm.activeProfileId(pid).collectAsStateWithLifecycle(initialValue = null)
     val role by vm.activeRole.collectAsStateWithLifecycle()
     val firstRow = remember { FocusRequester() }
+    // The gate's Enter PIN button takes focus while locked (TV).
+    val gateFocus = remember { FocusRequester() }
+    LaunchedEffect(unlocked) {
+        if (unlocked) return@LaunchedEffect
+        repeat(10) {
+            if (runCatching { gateFocus.requestFocus() }.isSuccess) return@LaunchedEffect
+            kotlinx.coroutines.delay(32L)
+        }
+    }
     // Re-lock whenever the active profile is (again) a Child.
     LaunchedEffect(role, activeId) {
         if (role == com.aeriotv.android.core.profiles.ProfileRole.Child) unlocked = false
@@ -125,26 +138,56 @@ fun ManageProfilesPage(onBack: () -> Unit) {
 
     Column(Modifier.fillMaxSize()) {
         SettingsDetailTopBar(title = "Manage Profiles", onBack = onBack)
-        LazyColumn(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
+        // Android TV's rail page: the first row rests where every other rail
+        // page's first element does (12 dp under the pane's top bar, y 102.5
+        // dp on screen), not above the rail's top line.
+        val inTvPane = com.aeriotv.android.ui.settings.rememberIsTvDevice() &&
+            com.aeriotv.android.ui.settings.LocalSettingsInPane.current
+        LazyColumn(
+            Modifier.fillMaxWidth().settingsPaneTopEdge(paneList).padding(horizontal = 16.dp),
+            state = paneList,
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(top = if (inTvPane) 12.dp else 0.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             if (!unlocked) {
+                // The gate (owner 2026-11-12, Apple parity): a centered lock, the
+                // sentence, and one "Enter PIN" button that opens the same PIN pad.
                 item("gate") {
-                    SettingsCard {
-                        SettingsActionRow(
-                            label = "Manage Profiles",
-                            leadingIcon = Icons.Filled.Lock,
-                            onClick = {
-                                if (vm.adminHasPin(pid)) {
-                                    asking = true
-                                } else {
-                                    // Inconsistent state (no Admin PIN while a Child
-                                    // exists, e.g. after a sync): never strand the Child.
-                                    Log.w("AerioProfiles", "[PROFILE] manage profiles: no Admin PIN exists; opening")
-                                    unlocked = true
-                                }
-                            },
-                        )
+                    Box(Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(
+                            Modifier.widthIn(max = 420.dp).padding(horizontal = 8.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                        ) {
+                            Icon(Icons.Filled.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(44.dp))
+                            Text(
+                                com.aeriotv.android.core.profiles.PinCopy.MANAGE_PROFILES_GATE,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                            androidx.compose.material3.Button(
+                                onClick = {
+                                    if (vm.adminHasPin(pid)) {
+                                        asking = true
+                                    } else {
+                                        // Inconsistent state (no Admin PIN while a Child
+                                        // exists, e.g. after a sync): never strand the Child.
+                                        Log.w("AerioProfiles", "[PROFILE] manage profiles: no Admin PIN exists; opening")
+                                        unlocked = true
+                                    }
+                                },
+                                modifier = Modifier
+                                    .widthIn(min = 200.dp)
+                                    .heightIn(min = 48.dp)
+                                    .focusRequester(gateFocus)
+                                    .dpadFocusRing(androidx.compose.foundation.shape.RoundedCornerShape(50), onFilled = true),
+                            ) {
+                                Text("Enter PIN", style = MaterialTheme.typography.titleMedium)
+                            }
+                        }
                     }
-                    SettingsSectionFooter("Enter a PIN from an Admin or Standard profile to switch profiles.")
                 }
             } else {
                 itemsIndexed(profiles, key = { _, p -> p.id }) { i, p ->
@@ -185,7 +228,7 @@ fun ManageProfilesPage(onBack: () -> Unit) {
     }
     refusal?.let { r -> ProfileRefusalDialog(r) { refusal = null } }
     if (asking) {
-        AdminPinDialog(pid, vm, title = "Enter a PIN from an Admin or Standard profile", onDismiss = { asking = false }) {
+        AdminPinDialog(pid, vm, title = com.aeriotv.android.core.profiles.PinCopy.ADMIN_PAD, onDismiss = { asking = false }) {
             asking = false
             unlocked = true
         }
@@ -335,19 +378,12 @@ internal fun ProfileMoveSheet(
     onMove: (com.aeriotv.android.core.profiles.ProfileManager.Move) -> Unit,
 ) {
     val at = profiles.indexOfFirst { it.id == profile.id }
-    com.aeriotv.android.ui.settings.SettingsAlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(profile.displayName) },
-        text = {
-            Column {
-                if (at > 0) ChoiceRow(label = "Move Left", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.Earlier) })
-                if (at in 0 until profiles.lastIndex) ChoiceRow(label = "Move Right", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.Later) })
-                if (at > 0) ChoiceRow(label = "Move to Front", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.First) })
-            }
-        },
-        confirmButton = {},
-        dismissButton = { com.aeriotv.android.ui.settings.SettingsDialogTextButton(label = "Cancel", onClick = onDismiss) },
-    )
+    // A plain list of actions: capsules, Cancel the last one (owner 2026-11-12).
+    ProfileActionStackDialog(title = profile.displayName, onCancel = onDismiss) {
+        if (at > 0) ProfileActionButton(label = "Move Left", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.Earlier) })
+        if (at in 0 until profiles.lastIndex) ProfileActionButton(label = "Move Right", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.Later) })
+        if (at > 0) ProfileActionButton(label = "Move to Front", onClick = { onMove(com.aeriotv.android.core.profiles.ProfileManager.Move.First) })
+    }
 }
 
 /** True while the active profile is a Child (reactive). */
@@ -620,7 +656,7 @@ internal class PickerAdder(
     @Composable
     fun Dialogs() {
         if (askPin) {
-            AdminPinDialog(playlistId, vm, title = "Enter a PIN from an Admin or Standard profile", onDismiss = { askPin = false; knownIds = null }) {
+            AdminPinDialog(playlistId, vm, title = com.aeriotv.android.core.profiles.PinCopy.ADMIN_PAD, onDismiss = { askPin = false; knownIds = null }) {
                 askPin = false
                 open()
             }

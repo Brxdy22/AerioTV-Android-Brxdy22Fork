@@ -1,5 +1,9 @@
 package com.aeriotv.android.feature.settings
 
+import androidx.compose.ui.layout.layoutId
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.focus.onFocusChanged
+import com.aeriotv.android.ui.settings.settingsPaneTopEdge
 import com.aeriotv.android.ui.scale.subtext
 import android.app.Activity
 import android.widget.Toast
@@ -76,9 +80,9 @@ import com.aeriotv.android.ui.settings.SettingsToggleRow
 import com.aeriotv.android.ui.settings.SettingsSectionFooter
 import com.aeriotv.android.ui.settings.dpadFocusRing
 import com.aeriotv.android.ui.settings.settingsRowCard
-import com.aeriotv.android.ui.settings.settingsTvFocusableRow
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudSync
@@ -286,12 +290,14 @@ fun SyncSettingsScreen(
         val lastSynced = maxOf(lastPush, lastPull)
         val tvRows = rememberIsTvDevice()
 
+        val paneList = androidx.compose.foundation.lazy.rememberLazyListState()
         LazyColumn(
+            state = paneList,
             // fillMaxHeight bounds the LazyColumn so its inner viewport can
             // scroll past the first screen of content - without it, the column
             // sized to wrap its contents and Settings -> Sync was stuck on
             // whatever fit above the bottom edge.
-            modifier = Modifier.settingsFormWidth().fillMaxHeight(),
+            modifier = Modifier.settingsFormWidth().fillMaxHeight().settingsPaneTopEdge(paneList),
             contentPadding = PaddingValues(
                 start = 16.dp,
                 end = 16.dp,
@@ -300,7 +306,11 @@ fun SyncSettingsScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (!signedIn && !driveNeedsSignIn) {
+            // Touch only: Android TV opens on the GOOGLE DRIVE eyebrow, as
+            // Apple TV opens on ICLOUD; its account row already says
+            // "Sign in to start syncing across devices", with the sign-in
+            // row right under it.
+            if (!tvRows && !signedIn && !driveNeedsSignIn) {
                 item { SignedOutWelcomeBanner() }
             }
             item {
@@ -309,15 +319,51 @@ fun SyncSettingsScreen(
                 // tinted icon tile, with Drive in place of iCloud. The
                 // account row stays first because Drive, unlike iCloud,
                 // needs an in-app sign-in.
+                // Apple TV (a22268e): small-caps eyebrows over standard rows,
+                // as every other Settings page; ICLOUD there, GOOGLE DRIVE here.
                 SettingsSection(
                     header = "Google Drive",
-                    // Apple TV shows no footer under this card.
-                    footer = if (tvRows) null else "Playlists, preferences, and VOD watch progress sync across all devices signed into the same Google account. Credentials are stored in your Drive app data, which only AerioTV can read.",
+                    // Apple TV shows no footer under this card. A build with
+                    // no OAuth client says so here on TV, under its rows.
+                    footer = if (tvRows) {
+                        if (!signedIn && !configured) DEVELOPER_CONFIG_HINT else null
+                    } else {
+                        "Playlists, preferences, and VOD watch progress sync across all devices signed into the same Google account. Credentials are stored in your Drive app data, which only AerioTV can read."
+                    },
                 ) {
                     AccountRow(
                         signedIn = signedIn,
                         email = accountEmail,
                     )
+                    // Google's own Sign in with Google button, right under
+                    // the account it signs in (TV and touch alike). It stays
+                    // a button, never a row: Google's branding rules.
+                    if (!signedIn) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                // TV: drawn bare between the row cards, not on one.
+                                .then(if (tvRows) Modifier.layoutId(com.aeriotv.android.ui.settings.SettingsFooterLayoutId) else Modifier)
+                                .padding(
+                                    horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(),
+                                    vertical = if (tvRows) 2.dp else 10.dp,
+                                ),
+                        ) {
+                            GoogleSignInButton(
+                                // Stays enabled even without OAuth config so the
+                                // tap explains why; a tap in flight is ignored
+                                // (the button never changes color for it).
+                                onClick = {
+                                    if (inFlight) return@GoogleSignInButton
+                                    if (!configured) {
+                                        notConfiguredDialogOpen = true
+                                    } else {
+                                        triggerSignIn()
+                                    }
+                                },
+                            )
+                        }
+                    }
                     SyncTileToggleRow(
                         icon = Icons.Filled.Cloud,
                         title = "Drive Sync",
@@ -338,13 +384,12 @@ fun SyncSettingsScreen(
                     if (masterEnabled && signedIn) {
                         SyncTileActionRow(
                             icon = Icons.Filled.CloudSync,
-                            // tvOS: single-line rows, the stamp rides the title.
-                            title = if (tvRows && lastSynced > 0L) {
-                                "Push to Drive  ·  Last synced ${lastSyncedAgo(lastSynced)}"
-                            } else {
-                                "Push to Drive"
-                            },
-                            subtitle = if (tvRows) null else if (lastSynced > 0L) {
+                            title = "Push to Drive",
+                            // Apple TV (a22268e): the stamp is the row's
+                            // subtitle, never inline after the title.
+                            subtitle = if (tvRows) {
+                                if (lastSynced > 0L) "Last synced ${lastSyncedAgo(lastSynced)}" else null
+                            } else if (lastSynced > 0L) {
                                 "Send this device's data up  ·  Last synced ${lastSyncedAgo(lastSynced)}"
                             } else {
                                 "Send this device's playlists, preferences and progress up"
@@ -384,6 +429,21 @@ fun SyncSettingsScreen(
                             },
                         )
                     }
+                    // TV: Sign Out closes the Drive card as a standard row,
+                    // tinted like Clear Drive Data.
+                    if (tvRows && (signedIn || driveNeedsSignIn)) {
+                        SyncTileActionRow(
+                            icon = Icons.AutoMirrored.Filled.Logout,
+                            title = "Sign Out",
+                            subtitle = null,
+                            destructive = true,
+                            onClick = {
+                                if (inFlight) return@SyncTileActionRow
+                                viewModel.signOut()
+                                Toast.makeText(context, "Signed out of Drive.", Toast.LENGTH_SHORT).show()
+                            },
+                        )
+                    }
                 }
             }
             // Sign-in / sign-out lives in its own row below the card so the
@@ -402,7 +462,7 @@ fun SyncSettingsScreen(
                     )
                 }
             }
-            item {
+            if (!tvRows) item {
                 if (driveNeedsSignIn && !signedIn) {
                     SignOutButton(
                         busy = inFlight,
@@ -426,26 +486,9 @@ fun SyncSettingsScreen(
                             Toast.makeText(context, "Signed out of Drive.", Toast.LENGTH_SHORT).show()
                         },
                     )
-                } else {
-                    SignInWithGoogleButton(
-                        // Stay enabled even without OAuth config so the
-                        // tap surfaces the explanation dialog. inFlight
-                        // only dims the pill; the tap is guarded so the
-                        // button keeps focus while the picker is up.
-                        busy = inFlight,
-                        onClick = {
-                            if (inFlight) return@SignInWithGoogleButton
-                            if (!configured) {
-                                notConfiguredDialogOpen = true
-                            } else {
-                                triggerSignIn()
-                            }
-                        },
-                    )
-                    if (!configured) {
-                        Spacer(Modifier.height(8.dp))
-                        DeveloperConfigHint()
-                    }
+                } else if (!configured) {
+                    // The sign-in button itself sits in the Google Drive card.
+                    DeveloperConfigHint()
                 }
             }
             // Dispatcharr Sync: independent of Drive Sync, both can be on
@@ -502,12 +545,10 @@ fun SyncSettingsScreen(
                             val dLast = dsyncUi.lastSyncAt
                             SyncTileActionRow(
                                 icon = Icons.Filled.CloudSync,
-                                title = if (tvRows && dLast > 0L) {
-                                    "Push to Dispatcharr  ·  Last synced ${lastSyncedAgo(dLast)}"
-                                } else {
-                                    "Push to Dispatcharr"
-                                },
-                                subtitle = if (tvRows) null else if (dLast > 0L) {
+                                title = "Push to Dispatcharr",
+                                subtitle = if (tvRows) {
+                                    if (dLast > 0L) "Last synced ${lastSyncedAgo(dLast)}" else null
+                                } else if (dLast > 0L) {
                                     "Send this device's data up  ·  Last synced ${lastSyncedAgo(dLast)}"
                                 } else {
                                     "Send this device's data up"
@@ -560,146 +601,102 @@ fun SyncSettingsScreen(
         // Kept although Apple pushes without asking: a blank install once
         // overwrote a good Drive backup, so an Android push states what it
         // does. A push merges per item since 2026-11-10 (Logan-approved copy).
-        com.aeriotv.android.ui.scale.AlertDialog(
+        // Apple's alert: Cancel left, Push right, neither preferred (no filled button).
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pushConfirmOpen = false },
-            title = { Text("Push to Drive?") },
-            text = {
-                Text(
-                    "This merges this device's changes into Google Drive.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Push",
-                    onClick = {
-                        pushConfirmOpen = false
-                        viewModel.runPushOnly()
-                    },
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { pushConfirmOpen = false })
-            },
+            title = "Push to Drive?",
+            message = "This merges this device's changes into Google Drive.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Push") {
+                    pushConfirmOpen = false
+                    viewModel.runPushOnly()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pushConfirmOpen = false },
+            ),
         )
     }
 
     if (dsyncPushConfirmOpen) {
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { dsyncPushConfirmOpen = false },
-            title = { Text("Push to Dispatcharr?") },
-            text = {
-                Text(
-                    "Replaces the shared data on your Dispatcharr server with this device's copy for the categories you sync. " +
-                        "Other devices receive it on their next sync.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(label = "Push", onClick = {
+            title = "Push to Dispatcharr?",
+            message = "Replaces the shared data on your Dispatcharr server with this device's copy for the categories you sync. " +
+                "Other devices receive it on their next sync.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Push") {
                     dsyncPushConfirmOpen = false
                     viewModel.runDispatcharrPush()
-                })
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { dsyncPushConfirmOpen = false })
-            },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { dsyncPushConfirmOpen = false },
+            ),
         )
     }
 
     if (dsyncPullConfirmOpen) {
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { dsyncPullConfirmOpen = false },
-            title = { Text("Pull from Dispatcharr?") },
-            text = {
-                Text("Replaces this device's shared data with the copy on your Dispatcharr server for the categories you sync.")
-            },
-            confirmButton = {
-                SettingsDialogTextButton(label = "Pull", onClick = {
+            title = "Pull from Dispatcharr?",
+            message = "Replaces this device's shared data with the copy on your Dispatcharr server for the categories you sync.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Pull") {
                     dsyncPullConfirmOpen = false
                     viewModel.runDispatcharrPull()
-                })
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { dsyncPullConfirmOpen = false })
-            },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { dsyncPullConfirmOpen = false },
+            ),
         )
     }
 
     if (bothPushConfirmOpen) {
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { bothPushConfirmOpen = false },
-            title = { Text("Push to both?") },
-            text = {
-                Text(
-                    "Replaces the shared data on your Dispatcharr server and in your Google Drive backup with this device's copy for the categories you sync.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(label = "Push", onClick = {
+            title = "Push to both?",
+            message = "Replaces the shared data on your Dispatcharr server and in your Google Drive backup with this device's copy for the categories you sync.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Push") {
                     bothPushConfirmOpen = false
                     viewModel.runPushToBoth()
-                })
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { bothPushConfirmOpen = false })
-            },
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { bothPushConfirmOpen = false },
+            ),
         )
     }
 
     if (pullConfirmOpen) {
         // Apple's "Pull from iCloud?" alert with Drive substituted. The pull
         // REPLACES this device's playlists and settings (Settings phase 3).
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pullConfirmOpen = false },
-            title = { Text("Pull from Drive?") },
-            text = {
-                Text(
-                    "This replaces this device's playlists and settings with the copy in Drive. " +
-                        "Playlists on this device that are not in Drive are removed. " +
-                        "If this device has the newest changes, push them up first.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Replace This Device",
-                    onClick = {
-                        pullConfirmOpen = false
-                        viewModel.runPullOnly()
-                    },
-                    destructive = true,
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { pullConfirmOpen = false })
-            },
+            title = "Pull from Drive?",
+            message = "This replaces this device's playlists and settings with the copy in Drive. " +
+                "Playlists on this device that are not in Drive are removed. " +
+                "If this device has the newest changes, push them up first.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Replace This Device", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    pullConfirmOpen = false
+                    viewModel.runPullOnly()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pullConfirmOpen = false },
+            ),
         )
     }
 
     if (clearConfirmOpen) {
         // Apple's "Clear iCloud Data?" alert, word for word with Drive in
         // place of iCloud. Clearing leaves sync on, exactly as Apple does.
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { clearConfirmOpen = false },
-            title = { Text("Clear Drive Data?") },
-            text = {
-                Text(
-                    "Wipes synced playlists, preferences, watch progress, and credentials from Drive. " +
-                        "This device's data is preserved. Drive Sync stays enabled, so your local state " +
-                        "will replace whatever was on Drive the next time the app pushes.",
-                )
-            },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Clear",
-                    onClick = {
-                        clearConfirmOpen = false
-                        viewModel.runClearRemote()
-                    },
-                    destructive = true,
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { clearConfirmOpen = false })
-            },
+            title = "Clear Drive Data?",
+            message = "Wipes synced playlists, preferences, watch progress, and credentials from Drive. " +
+                "This device's data is preserved. Drive Sync stays enabled, so your local state " +
+                "will replace whatever was on Drive the next time the app pushes.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Clear", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    clearConfirmOpen = false
+                    viewModel.runClearRemote()
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { clearConfirmOpen = false },
+            ),
         )
     }
 
@@ -812,12 +809,15 @@ private fun SignedOutWelcomeBanner() {
  * of dominating the screen with a red error banner. End-user releases ship
  * with the ID baked in and never see this row.
  */
+private const val DEVELOPER_CONFIG_HINT =
+    "This build doesn't have a Google Cloud OAuth client configured, so " +
+        "Sign in with Google is disabled. Add GOOGLE_DRIVE_WEB_CLIENT_ID to " +
+        "local.properties and register the signing-cert SHA-1 in the same Cloud project."
+
 @Composable
 private fun DeveloperConfigHint() {
     Text(
-        text = "This build doesn't have a Google Cloud OAuth client configured, so " +
-            "Sign in with Google is disabled. Add GOOGLE_DRIVE_WEB_CLIENT_ID to " +
-            "local.properties and register the signing-cert SHA-1 in the same Cloud project.",
+        text = DEVELOPER_CONFIG_HINT,
         style = MaterialTheme.typography.labelSmall.subtext(),
         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.70f),
         modifier = Modifier.padding(horizontal = 4.dp),
@@ -826,15 +826,26 @@ private fun DeveloperConfigHint() {
 
 @Composable
 private fun AccountRow(signedIn: Boolean, email: String) {
+    val tv = rememberIsTvDevice()
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .then(if (tv) Modifier.heightIn(min = com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowMinHeight) else Modifier)
+            // Apple TV: a standard row, not a focus stop (Select would do
+            // nothing on it).
             .settingsRowCard(focused = false)
-            .settingsTvFocusableRow()
-            .padding(horizontal = 16.dp, vertical = 14.dp),
+            .padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = if (tv) com.aeriotv.android.ui.settings.TvSettingsMetrics.paneRowPaddingV else 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
+        // Apple TV's account row is a SettingsRow: the person glyph in the
+        // shared tile, then the row's title and subtitle sizes.
+        if (tv) {
+            com.aeriotv.android.ui.settings.SettingsIconTile(
+                icon = if (signedIn) androidx.compose.material.icons.Icons.Filled.AccountCircle
+                else androidx.compose.material.icons.Icons.Outlined.AccountCircle,
+            )
+            Spacer(Modifier.size(com.aeriotv.android.ui.settings.TvSettingsMetrics.iconTileGap))
+        } else Box(
             modifier = Modifier
                 .size(36.dp)
                 .clip(androidx.compose.foundation.shape.CircleShape)
@@ -855,13 +866,14 @@ private fun AccountRow(signedIn: Boolean, email: String) {
                 modifier = Modifier.size(20.dp),
             )
         }
-        Spacer(Modifier.size(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
+        if (!tv) Spacer(Modifier.size(12.dp))
+        // TV: the standard row's 2 dp between title and subtitle.
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(if (tv) 2.dp else 0.dp)) {
             Text(
                 text = if (signedIn) "Signed in to Drive" else "Not signed in",
-                style = MaterialTheme.typography.bodyLarge,
+                style = if (tv) settingsRowTitleStyle() else MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onBackground,
-                fontWeight = FontWeight.Medium,
+                fontWeight = if (tv) FontWeight.Normal else FontWeight.Medium,
             )
             Text(
                 text = when {
@@ -869,7 +881,7 @@ private fun AccountRow(signedIn: Boolean, email: String) {
                     signedIn -> "Account connected"
                     else -> "Sign in to start syncing across devices"
                 },
-                style = MaterialTheme.typography.bodySmall.subtext(),
+                style = (if (tv) com.aeriotv.android.ui.settings.settingsRowSubtitleStyle() else MaterialTheme.typography.bodySmall).subtext(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -877,7 +889,7 @@ private fun AccountRow(signedIn: Boolean, email: String) {
 }
 
 /**
- * Full-width Sign-Out CTA - pairs visually with [SignInWithGoogleButton]
+ * Full-width Sign-Out CTA on touch (TV draws Sign Out as a row)
  * (same rounded-pill height and stretch). Renders below the account card
  * when signed in so the destructive action has space to breathe.
  */
@@ -907,61 +919,74 @@ private fun SignOutButton(busy: Boolean, onClick: () -> Unit) {
 }
 
 /**
- * Google-branded Sign in button. We render a Compose approximation that
- * follows Google's brand guidelines (white background, 1px outline, Google G
- * mark on the left, "Sign in with Google" label). Avoids embedding a raster
- * since the brand asset has strict size/colour rules and the rendering here
- * stays consistent across light/dark themes.
+ * Google's Sign in with Google button, as its branding guidelines define it
+ * (developers.google.com/identity/branding-guidelines), on every device:
+ * - the dark theme exactly: fill #131314, a 1 dp #8E918F stroke inside the
+ *   edge, text #E3E3E3, never recolored by AerioTV's accent;
+ * - Google's full-color G, unmodified, straight on the #131314 fill;
+ * - the text "Sign in with Google", medium, 14/20;
+ * - the pill shape, 12 dp before the G, 10 dp after it, 12 dp after the
+ *   text, 40 dp tall at its natural width (never stretched).
+ * Google Sans is not bundled with Android or this app; the guidelines name no
+ * fallback, and Google's own Android SignInButton draws its label in the
+ * system font, so this uses the system sans-serif (Roboto) in medium.
+ * On TV, focus draws AerioTV's ring around the button, outside it, and the
+ * button's own colors never change; on touch a press shows the standard
+ * ripple.
  */
 @Composable
-private fun SignInWithGoogleButton(busy: Boolean, onClick: () -> Unit) {
-    val enabled = !busy
-    // Google ships two officially-permitted button styles: light (white BG /
-    // dark text) and dark (#131314 BG / white text). Both must use the
-    // full four-color G mark - the only freedom callers have is which
-    // background variant they pick. The dark variant lands much better
-    // against AerioTV's navy app surface than the white pill the previous
-    // cut used, while staying compliant with Google's brand guidelines.
-    // Tokens:
-    //  - background #131314 (Google's "Dark" button surface)
-    //  - 1dp outline #8E918F (Google's "Dark" 1dp stroke)
-    //  - text #E3E3E3 (Google's "Dark" foreground)
-    val bg = if (enabled) Color(0xFF131314) else Color(0xFF131314).copy(alpha = 0.55f)
-    val stroke = Color(0xFF8E918F).copy(alpha = if (enabled) 1f else 0.55f)
-    val fg = if (enabled) Color(0xFFE3E3E3) else Color(0xFFE3E3E3).copy(alpha = 0.55f)
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = 48.dp)
-            .clip(RoundedCornerShape(50))
-            .background(bg)
-            .border(1.dp, stroke, RoundedCornerShape(50))
-            // Brand pill stays untouched at rest; the white ring only draws under D-pad focus.
-            .dpadFocusRing(RoundedCornerShape(50))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center,
+private fun GoogleSignInButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val tv = rememberIsTvDevice()
+    var focused by remember { mutableStateOf(false) }
+    val pill = RoundedCornerShape(50)
+    Box(
+        modifier = modifier
+            .then(
+                if (focused) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, pill) else Modifier,
+            )
+            // Room for the ring, always reserved so focus never moves the button.
+            .padding(3.dp),
     ) {
-        Icon(
-            painter = androidx.compose.ui.res.painterResource(
-                id = com.aeriotv.android.R.drawable.ic_google_g,
-            ),
-            contentDescription = null,
-            // Tint.Unspecified preserves the four-color brand mark; tinting
-            // would flatten it to a single colour which Google disallows.
-            tint = Color.Unspecified,
-            modifier = Modifier.size(20.dp),
-        )
-        Spacer(Modifier.size(12.dp))
-        Text(
-            text = "Sign in with Google",
-            color = fg,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Medium,
-        )
+        Row(
+            modifier = Modifier
+                .height(40.dp)
+                .clip(pill)
+                .background(GoogleButtonFill)
+                .border(1.dp, GoogleButtonStroke, pill)
+                .onFocusChanged { focused = it.isFocused }
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    // TV: no focus or press tint on Google's colors.
+                    indication = if (tv) null else androidx.compose.material3.ripple(),
+                    onClick = onClick,
+                )
+                .padding(start = 12.dp, end = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            androidx.compose.foundation.Image(
+                painter = androidx.compose.ui.res.painterResource(id = com.aeriotv.android.R.drawable.ic_google_g),
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = "Sign in with Google",
+                color = GoogleButtonText,
+                fontFamily = androidx.compose.ui.text.font.FontFamily.SansSerif,
+                fontWeight = FontWeight.Medium,
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+                letterSpacing = 0.25.sp,
+                maxLines = 1,
+            )
+        }
     }
 }
+
+/** Google's dark-theme button colors (branding guidelines). */
+private val GoogleButtonFill = Color(0xFF131314)
+private val GoogleButtonStroke = Color(0xFF8E918F)
+private val GoogleButtonText = Color(0xFFE3E3E3)
 
 // Phase 61b: removed the inline GoogleGMark approximation - the button now
 // renders the official four-color brand mark from res/drawable/ic_google_g.xml.
@@ -976,6 +1001,11 @@ private fun SignInWithGoogleButton(busy: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun SyncIconTile(icon: ImageVector, color: Color) {
+    // Apple TV draws these with the shared tvOS tile (48 pt, halved).
+    if (rememberIsTvDevice()) {
+        com.aeriotv.android.ui.settings.SettingsIconTile(icon = icon, tint = color)
+        return
+    }
     Box(
         modifier = Modifier
             .size(32.dp)
@@ -1002,16 +1032,20 @@ private fun SyncRowText(
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        // Apple TV's SettingsRow: a regular-weight title and a bodySmall
+        // subtitle (tvOS 24 / 22 pt). Touch keeps its medium title and
+        // footnote subtitle.
+        val tv = rememberIsTvDevice()
         Text(
             text = title,
             style = settingsRowTitleStyle(),
             color = titleColor,
-            fontWeight = FontWeight.Medium,
+            fontWeight = if (tv) FontWeight.Normal else FontWeight.Medium,
         )
         if (subtitle != null) {
             Text(
                 text = subtitle,
-                style = settingsFootnoteStyle().subtext(),
+                style = (if (tv) com.aeriotv.android.ui.settings.settingsRowSubtitleStyle() else settingsFootnoteStyle()).subtext(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -1041,7 +1075,7 @@ private fun SyncTileToggleRow(
         modifier = Modifier.alpha(if (enabled) 1f else 0.5f),
     ) {
         SyncIconTile(icon, MaterialTheme.colorScheme.primary)
-        Spacer(Modifier.width(14.dp))
+        Spacer(Modifier.width(syncTileGap()))
         SyncRowText(
             title = title,
             subtitle = subtitle,
@@ -1075,7 +1109,7 @@ private fun SyncTileActionRow(
     val tint = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
     SettingsRowContainer(onClick = { if (!running) onClick() }) {
         SyncIconTile(icon, tint)
-        Spacer(Modifier.width(14.dp))
+        Spacer(Modifier.width(syncTileGap()))
         SyncRowText(
             title = title,
             subtitle = subtitle,
@@ -1103,6 +1137,11 @@ private fun SyncTileActionRow(
         }
     }
 }
+
+/** Tile-to-text gap: tvOS 14 pt (7 dp) on TV, the phone's 14 dp on touch. */
+@Composable
+private fun syncTileGap() =
+    if (rememberIsTvDevice()) com.aeriotv.android.ui.settings.TvSettingsMetrics.iconTileGap else 14.dp
 
 /** Apple's lastSyncedString: "just now", "5m ago", "3h ago", "2d ago". */
 private fun lastSyncedAgo(millis: Long): String {
@@ -1213,11 +1252,17 @@ fun SyncCategoriesScreen(
                 // Data rows are plain on/off toggles.
                 val choices = SyncScope.choices(viewModel.syncDeviceIsTv)
                 val scopeOptions = choices.map { SettingsPickerOption(it, it.title) }
+                // Apple (iOS and tvOS): a settings group lists only its
+                // settings, and Your Data lists every data item in catalog
+                // order, so Remote Button Map (filed under Remote Control)
+                // leads Your Data.
+                val allDataItems = SyncItemCatalog.groups.flatMap { g -> g.items.filter { it.isData } }
                 SyncItemCatalog.groups.forEach { group ->
-                    val items = group.items.filter { (!dsync || !it.driveOnly) && (dsyncOn || !it.dsyncOnly) }
+                    val groupItems = if (group.id == "data") allDataItems else group.items.filterNot { it.isData }
+                    val items = groupItems.filter { (!dsync || !it.driveOnly) && (dsyncOn || !it.dsyncOnly) }
                     if (items.isEmpty()) return@forEach
                     item(key = "sync-group-${group.id}") {
-                        SettingsSection(header = group.title) {
+                        SettingsSection(header = group.title, titleHeader = true) {
                             val settingsItems = items.filterNot { it.isData }
                             if (settingsItems.size > 1) {
                                 val values = settingsItems.map { scopes[it.id] ?: SyncScope.All }.distinct()
@@ -1256,7 +1301,7 @@ fun SyncCategoriesScreen(
                 }
                 if (!dsync) {
                     item {
-                        SettingsSection(header = "Delete from Drive", footer = footer) {
+                        SettingsSection(header = "Delete from Drive", footer = footer, titleHeader = true) {
                             SyncCategory.entries.forEach { category ->
                                 val status = clearStatuses[category]
                                 SyncTileActionRow(
@@ -1280,23 +1325,17 @@ fun SyncCategoriesScreen(
 
     pendingDelete?.let { category ->
         val name = settingsCategoryTitle(category)
-        com.aeriotv.android.ui.scale.AlertDialog(
+        com.aeriotv.android.ui.settings.AlertPrompt(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Remove $name from Drive?") },
-            text = { Text("This will remove your $name from Drive. Other devices will keep their local copy.") },
-            confirmButton = {
-                SettingsDialogTextButton(
-                    label = "Delete",
-                    onClick = {
-                        pendingDelete = null
-                        viewModel.runClearRemoteCategory(category)
-                    },
-                    destructive = true,
-                )
-            },
-            dismissButton = {
-                SettingsDialogTextButton(label = "Cancel", onClick = { pendingDelete = null })
-            },
+            title = "Remove $name from Drive?",
+            message = "This will remove your $name from Drive. Other devices will keep their local copy.",
+            actions = listOf(
+                com.aeriotv.android.ui.settings.AlertAction("Delete", com.aeriotv.android.ui.settings.AlertRole.Destructive) {
+                    pendingDelete = null
+                    viewModel.runClearRemoteCategory(category)
+                },
+                com.aeriotv.android.ui.settings.AlertAction("Cancel", com.aeriotv.android.ui.settings.AlertRole.Cancel) { pendingDelete = null },
+            ),
         )
     }
 }
