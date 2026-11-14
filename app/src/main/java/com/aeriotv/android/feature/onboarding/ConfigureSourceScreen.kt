@@ -191,7 +191,7 @@ fun ConfigureSourceScreen(
         return
     }
     if (userQrProbing) {
-        androidx.compose.ui.window.Dialog(onDismissRequest = {}) {
+        com.aeriotv.android.ui.scale.Dialog(onDismissRequest = {}) {
             androidx.compose.foundation.layout.Row(
                 Modifier.background(MaterialTheme.colorScheme.surface, androidx.compose.foundation.shape.RoundedCornerShape(16.dp)).padding(20.dp),
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
@@ -205,7 +205,7 @@ fun ConfigureSourceScreen(
     userQrPick?.let { (found, k) ->
         var userOnly by remember(found) { mutableStateOf(false) }
         // Headline, card, and buttons as in Set up another device (SetUpTvScreen, 12 dp spacing, 560 dp column), sized to content.
-        androidx.compose.ui.window.Dialog(
+        com.aeriotv.android.ui.scale.Dialog(
             onDismissRequest = { userQrPick = null },
             properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
         ) {
@@ -1304,7 +1304,14 @@ internal fun GuideHistoryRow(
             fontWeight = FontWeight.Medium,
         )
         Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        // When the pills do not fit on one line (a phone at a large Text
+        // Size) they wrap to the next, 8 apart, so every label stays whole;
+        // one row clipped "All" off the screen and broke "14 Days" in two
+        // (Apple 93df638).
+        androidx.compose.foundation.layout.FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             // 0 = All Available (Logan 2026-09-11); legacy 30 reads as All.
             listOf(1, 3, 7, 14, 0).forEach { days ->
                 val selected = days == sanitizeGuideDays(selectedDays)
@@ -1315,6 +1322,8 @@ internal fun GuideHistoryRow(
                         else -> "$days Days"
                     },
                     style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    softWrap = false,
                     color = if (selected) MaterialTheme.colorScheme.onPrimary
                     else MaterialTheme.colorScheme.onBackground,
                     modifier = Modifier

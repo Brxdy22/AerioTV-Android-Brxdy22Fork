@@ -380,8 +380,10 @@ fun EditPlaylistScreen(
                 top = 16.dp,
                 bottom = LocalTabBarBottomInset.current,
             ),
+            // Android TV keeps its 24 dp; phones and tablets take the shared
+            // section spacing (Apple's inset-grouped rhythm).
             verticalArrangement = Arrangement.spacedBy(
-                com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing,
+                if (isTv) 24.dp else com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing,
             ),
         ) {
             // A failed save keeps the user on the form with their typed values
@@ -656,10 +658,12 @@ fun EditPlaylistScreen(
                         options = listOf(1, 3, 7, 14, 0).map { days ->
                             SettingsPickerOption(
                                 value = days,
+                                // New playlists start on All (PlaylistEntity
+                                // GUIDE_DAYS_ALL), so All carries "(Default)",
+                                // as on Apple (EditServerSheet GuideDayChoices).
                                 label = when (days) {
-                                    0 -> "All"
+                                    0 -> "All (Default)"
                                     1 -> "1 Day"
-                                    7 -> "7 Days (Default)"
                                     else -> "$days Days"
                                 },
                             )

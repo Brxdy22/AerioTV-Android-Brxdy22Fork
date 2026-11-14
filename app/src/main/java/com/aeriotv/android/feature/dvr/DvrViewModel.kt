@@ -154,6 +154,12 @@ class DvrViewModel @Inject constructor(
         /** Why an on-device recording failed (Apple's wording), shown in its details. */
         val failureReason: String? = null,
         /**
+         * The channel an on-device recording was made from, as saved with it
+         * (LocalRecordingRules.shownChannelName). Null on server rows, whose
+         * channel comes from [dispatcharrChannelId], and when none was saved.
+         */
+        val channelName: String? = null,
+        /**
          * A finished on-device recording whose file is not there (removed
          * outside the app): badged "Missing", "File missing" in its
          * details, no Play, still deletable (Apple 743bd6b).
@@ -477,6 +483,8 @@ class DvrViewModel @Inject constructor(
                             endMillis = active.endsAt,
                             status = Recording.Status.Recording,
                             fileSizeBytes = 0L,
+                            channelName = com.aeriotv.android.core.data.LocalRecordingRules
+                                .shownChannelName(active.channelName, active.title),
                         )
                     }
                     st.copy(
@@ -545,6 +553,9 @@ class DvrViewModel @Inject constructor(
                             fileMissing = com.aeriotv.android.core.data.LocalRecordingRules.isMissing(r.status, r.filePath) { p ->
                                 com.aeriotv.android.core.data.LocalRecordingFiles.probe(appContext, p).bytes != null
                             },
+                            // Program Info's Format comes from the file's
+                            // name; a Downloads file's path has none.
+                            fileName = com.aeriotv.android.core.data.LocalRecordingFiles.displayName(appContext, r.filePath),
                         )
                     }
                 }
@@ -702,8 +713,8 @@ class DvrViewModel @Inject constructor(
                         }
                         return@fold
                     }
-                    val hosts = trustedServerHosts(playlist)
-                    val server = remote.map { it.toRecording(base, dispatcharrClient, hosts) }
+                    val servers = trustedServerUrls(playlist)
+                    val server = remote.map { it.toRecording(base, dispatcharrClient, servers) }
                     // Fill in programme title/description (and any cached category)
                     // from the on-disk guide for rows the server left sparse. This
                     // is a fast LOCAL pass (Room reads only, no network), plus it
@@ -1012,7 +1023,7 @@ class DvrViewModel @Inject constructor(
             // Recording on its own, so no status guessing. The row uses the
             // same "server-$id" key the refresh-produced row will, so the
             // dedup-by-id guard in refresh() reconciles it in place.
-            val optimistic = result.toRecording(base, dispatcharrClient, trustedServerHosts(playlist))
+            val optimistic = result.toRecording(base, dispatcharrClient, trustedServerUrls(playlist))
             _state.update { st ->
                 val without = st.recordings.filterNot { it.id == optimistic.id }
                 st.copy(recordings = (without + optimistic).sortedBy { it.startMillis })
@@ -1139,9 +1150,10 @@ class DvrViewModel @Inject constructor(
      * appears in the DVR tab as a Local copy playable offline. Mirrors iOS
      * downloadDispatcharrRecording. Server recordings only; the playbackUrl is
      * the same /file/ URL used for streaming, fetched with the source's
-     * X-API-Key.
+     * X-API-Key. [channelName] is the server recording's channel, saved with
+     * the copy so its Program Info names it (Apple keeps the server row's).
      */
-    suspend fun saveToDevice(recording: Recording): Result<Unit> {
+    suspend fun saveToDevice(recording: Recording, channelName: String = ""): Result<Unit> {
         if (recording.source != Source.Server) {
             return Result.failure(IllegalStateException("Save to Device is for server recordings."))
         }
@@ -1156,7 +1168,7 @@ class DvrViewModel @Inject constructor(
                 context = appContext,
                 fileUrl = url,
                 title = recording.title,
-                channelName = recording.title,
+                channelName = channelName,
                 apiKey = key,
                 userAgent = com.aeriotv.android.core.network.PlaybackHeaders
                     .customUserAgent(playlist).orEmpty(),
@@ -1370,7 +1382,7 @@ class DvrViewModel @Inject constructor(
 private fun DispatcharrRecording.toRecording(
     baseUrl: String,
     client: DispatcharrClient,
-    trustedHosts: Set<String>,
+    trustedServers: List<String>,
 ): DvrViewModel.Recording {
     val start = parseIsoMillis(startTime) ?: 0L
     val end = parseIsoMillis(endTime) ?: start
@@ -1396,7 +1408,7 @@ private fun DispatcharrRecording.toRecording(
     val playback: String? = when (status) {
         DvrViewModel.Recording.Status.Completed,
         DvrViewModel.Recording.Status.Stopped ->
-            resolveRecordingUrl(fileUrl, baseUrl, trustedHosts) ?: client.recordingPlaybackUrl(baseUrl, id)
+            resolveRecordingUrl(fileUrl, baseUrl, trustedServers) ?: client.recordingPlaybackUrl(baseUrl, id)
         else -> null
     }
     // In-progress catch-up / watch-live (audit #50, iOS v1.6.22 + #29).
@@ -1405,7 +1417,7 @@ private fun DispatcharrRecording.toRecording(
     // /file/ partial. Only the .m3u8 case is a true growing DVR window;
     // the raw partial plays as fixed VOD.
     val inProgress: String? = if (status == DvrViewModel.Recording.Status.Recording) {
-        resolveRecordingUrl(fileUrl, baseUrl, trustedHosts) ?: client.recordingPlaybackUrl(baseUrl, id)
+        resolveRecordingUrl(fileUrl, baseUrl, trustedServers) ?: client.recordingPlaybackUrl(baseUrl, id)
     } else null
     val dvr = inProgress?.contains(".m3u8", ignoreCase = true) == true
     val cp = customProperties
@@ -1457,14 +1469,12 @@ private fun DispatcharrRecording.toRecording(
 }
 
 /**
- * Hosts a recording FILE url may point at: the playlist's remote URL host and
- * its LAN URL host. Dispatcharr builds absolute URLs from whichever address it
- * was configured with, which need not be the base this device is using now.
+ * Addresses a recording FILE url may point at: the playlist's remote URL and
+ * its LAN URL. Dispatcharr builds absolute URLs from whichever address it was
+ * configured with, which need not be the base this device is using now.
  */
-private fun trustedServerHosts(playlist: com.aeriotv.android.core.data.db.entity.PlaylistEntity): Set<String> =
-    listOfNotNull(playlist.urlString, playlist.lanUrlString)
-        .mapNotNull { u -> runCatching { java.net.URI(u.trim()).host }.getOrNull()?.lowercase() }
-        .toSet()
+private fun trustedServerUrls(playlist: com.aeriotv.android.core.data.db.entity.PlaylistEntity): List<String> =
+    listOfNotNull(playlist.urlString, playlist.lanUrlString).filter { it.isNotBlank() }
 
 /** Hosts already reported as rejected this process, so the 30 s refresh logs each once. */
 private val rejectedFileHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -1472,28 +1482,35 @@ private val rejectedFileHosts = java.util.concurrent.ConcurrentHashMap.newKeySet
 /**
  * Resolve a Dispatcharr-reported recording file_url against the active
  * server's effective base URL. Mirrors iOS resolveRecordingURL
- * (MyRecordingsView.swift line 614): an already-absolute value is used if its
- * host is one of [trustedHosts]; a relative path is anchored to the base.
- * Returns null for a blank input or an untrusted host.
+ * (MyRecordingsView.swift line 614): an already-absolute value is used if it
+ * is on one of [trustedServers] by the shared sign-in rule (an http URL that
+ * a server behind an untrusted TLS proxy reported for its own host is taken
+ * as https); a relative path is anchored to the base. Returns null for a
+ * blank input or an untrusted address.
  */
-private fun resolveRecordingUrl(fileUrl: String?, baseUrl: String, trustedHosts: Set<String>): String? {
+private fun resolveRecordingUrl(fileUrl: String?, baseUrl: String, trustedServers: List<String>): String? {
     val trimmed = fileUrl?.trim().orEmpty()
     if (trimmed.isEmpty()) return null
     if (trimmed.startsWith("http://", ignoreCase = true) ||
         trimmed.startsWith("https://", ignoreCase = true)
     ) {
         // The recording player sends X-API-Key with this request, so an
-        // absolute file_url on any host other than the playlist's own remote
-        // or LAN host is rejected: it would hand the API key to that host.
-        val host = runCatching { java.net.URI(trimmed).host }.getOrNull()?.lowercase()
-        if (host == null || host !in trustedHosts) {
-            val key = host ?: "<unparseable>"
+        // absolute file_url is used only on the playlist's own remote or LAN
+        // address: same host and effective port, and never https to http
+        // (RedirectAuthRule). Anything else would hand the API key to another
+        // host or port, or send it in the clear. A server behind a TLS proxy it
+        // does not trust reports its own URLs as http: on the server's host,
+        // port 80 or the server's port, that one is used as https.
+        val usable = com.aeriotv.android.core.network.RedirectAuthRule.serverUrlFor(trimmed, trustedServers)
+        if (usable == null) {
+            val key = runCatching { java.net.URI(trimmed).let { u -> "${u.host?.lowercase()}:${u.port}" } }
+                .getOrNull() ?: "<unparseable>"
             if (rejectedFileHosts.add(key)) {
-                android.util.Log.w("DvrViewModel", "resolveRecordingUrl: rejected file_url on untrusted host $key (logged once per host)")
+                android.util.Log.w("DvrViewModel", "resolveRecordingUrl: rejected file_url on untrusted address $key (logged once per address)")
             }
             return null
         }
-        return trimmed
+        return usable
     }
     val base = baseUrl.trimEnd('/')
     if (base.isEmpty()) return null
@@ -1514,7 +1531,7 @@ private fun resolveArtUrl(url: String, baseUrl: String): String {
     return base + (if (trimmed.startsWith("/")) trimmed else "/$trimmed")
 }
 
-private fun LocalRecordingEntity.toRecording(fileMissing: Boolean = false): DvrViewModel.Recording {
+private fun LocalRecordingEntity.toRecording(fileMissing: Boolean = false, fileName: String? = null): DvrViewModel.Recording {
     val status = when (this.status.lowercase()) {
         // A capture cut short keeps what it captured and plays, like a
         // server recording Dispatcharr marks interrupted.
@@ -1552,7 +1569,9 @@ private fun LocalRecordingEntity.toRecording(fileMissing: Boolean = false): DvrV
         savedOnDevice = playlistId == null,
         partial = this.status.lowercase() == InterruptedCapture.INTERRUPTED,
         failureReason = failureReason.takeIf { status == DvrViewModel.Recording.Status.Failed },
+        channelName = com.aeriotv.android.core.data.LocalRecordingRules.shownChannelName(channelName, title),
         fileMissing = fileMissing,
+        fileName = fileName,
     )
 }
 

@@ -25,7 +25,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material3.AlertDialog
+import com.aeriotv.android.ui.scale.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -58,7 +58,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
+import com.aeriotv.android.ui.scale.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -248,18 +248,25 @@ fun PinEntryDialog(
                             focusClear = focusClear,
                         )
                         isTv -> {
-                            // Focus target for the raw D-pad capture.
+                            // Focus target for the raw D-pad capture. The hint
+                            // fills the pad's width and centers its lines under
+                            // the dots (Apple's TV pad, 1f9dbc8). "the PIN", not
+                            // "your PIN": the same pad sets and enters other
+                            // profiles' PINs; the wording matches Apple's.
                             Box(
                                 Modifier
+                                    .fillMaxWidth()
                                     .focusRequester(rootFocus)
                                     .focusable()
                                     .padding(8.dp),
+                                contentAlignment = Alignment.Center,
                             ) {
                                 Text(
-                                    "Up, Down, Left, Right. Select to confirm, Back to clear.",
+                                    "Use the directional pad to enter the PIN. Select to confirm, Back to clear.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth(),
                                 )
                             }
                         }

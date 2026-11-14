@@ -45,6 +45,7 @@ import com.aeriotv.android.ui.settings.SettingsTextField
 import com.aeriotv.android.ui.settings.SettingsToggleRow
 import com.aeriotv.android.ui.settings.dpadFocusRing
 import com.aeriotv.android.ui.settings.rememberIsTvDevice
+import com.aeriotv.android.ui.settings.settingsFooterPull
 import com.aeriotv.android.ui.settings.settingsFormWidth
 import com.aeriotv.android.ui.tv.TvKeyboardOnOkHost
 
@@ -85,7 +86,7 @@ fun MoviesAndTvShowsSettingsScreen(
                         top = 12.dp,
                         bottom = LocalTabBarBottomInset.current,
                     ),
-                    verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(20.dp)),
+                    verticalArrangement = Arrangement.spacedBy(com.aeriotv.android.ui.settings.settingsSectionSpacing(com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing)),
                 ) {
                     // MARK: Refresh library
                     //
@@ -121,10 +122,11 @@ fun MoviesAndTvShowsSettingsScreen(
                         Column {
                             SettingsSection(
                                 header = "The Movie Database",
-                                // Apple iOS: the footer is always shown. Apple tvOS:
-                                // the same text sits under the buttons, only while
-                                // the toggle is on (rendered below the card here).
-                                footer = if (isTv) null else TMDB_FOOTER_PHONE,
+                                // Apple iOS: the footer is always shown, with the
+                                // short attribution in it. Apple tvOS: the same text
+                                // sits under the buttons, only while the toggle is
+                                // on. Both are rendered below the card here.
+                                footer = null,
                             ) {
                                 SettingsToggleRow(
                                     title = "Use TMDB for Movies and TV Shows",
@@ -204,17 +206,34 @@ fun MoviesAndTvShowsSettingsScreen(
                                     }
                                 }
                             }
-                            if (isTv && programPostersTmdb) {
-                                com.aeriotv.android.ui.settings.SettingsSectionFooter(TMDB_FOOTER_TV)
+                            if (isTv) {
+                                if (programPostersTmdb) {
+                                    com.aeriotv.android.ui.settings.SettingsSectionFooter(TMDB_FOOTER_TV)
+                                }
+                                // Apple tvOS: long attribution below, always.
+                                TmdbAttribution(
+                                    modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 8.dp),
+                                    long = true,
+                                    isTv = true,
+                                    caption = true,
+                                )
+                            } else {
+                                // Apple iOS: the footer is VStack(spacing: 10) of the
+                                // text and the short attribution, so the logo starts
+                                // 10 under the text, and the pair ends the section:
+                                // the footer pull applies to the pair, not to the
+                                // text, which let the logo draw over its last line.
+                                val inset = com.aeriotv.android.ui.settings.settingsRowInsetH()
+                                Column(modifier = Modifier.settingsFooterPull()) {
+                                    com.aeriotv.android.ui.settings.SettingsSectionFooter(TMDB_FOOTER_PHONE)
+                                    TmdbAttribution(
+                                        modifier = Modifier.padding(start = inset, end = inset, top = 10.dp),
+                                        long = false,
+                                        isTv = false,
+                                        caption = false,
+                                    )
+                                }
                             }
-                            // Apple iOS: short attribution inside the footer, always.
-                            // Apple tvOS: long attribution below, always.
-                            TmdbAttribution(
-                                modifier = Modifier.padding(horizontal = com.aeriotv.android.ui.settings.settingsRowInsetH(), vertical = 8.dp),
-                                long = isTv,
-                                isTv = isTv,
-                                caption = isTv,
-                            )
                         }
                     }
 
@@ -252,11 +271,13 @@ fun MoviesAndTvShowsSettingsScreen(
 private const val VOD_REFRESH_FOOTNOTE =
     "How often the library re-scans in the background. Opening the app always shows the cached library first."
 
-// Apple's footers say iCloud Keychain; Android carries the key in the Sync
-// snapshot to the user's own Google Drive app data (AppPreferences sync
-// export), so the sentence names that instead. The rest is Apple's text.
+// Apple's first sentence names the Keychain and iCloud Keychain. Android
+// keeps the key on the device (encrypted at rest) and Google Drive carries it
+// in the Credentials file (2026-11-13), so the first sentence has Apple's
+// shape with Drive in iCloud Keychain's place. The Dispatcharr Sync sentence
+// (schema section 4.13) and the rest are Apple's text, byte for byte.
 private const val TMDB_SYNC_SENTENCE =
-    "If Sync is enabled, your key is saved to your Google Drive app data and syncs to your other devices."
+    "Your key is saved on this device and, with Google Drive Sync on, syncs to your other Android devices. With Dispatcharr Sync on, this key syncs to your other devices signed in as this user."
 private const val TMDB_FOOTER_PHONE = TMDB_SYNC_SENTENCE +
     " Get a free key at themoviedb.org under Settings, then API; paste either the API Key or the Read Access Token. With a key, artwork and details for Movies and TV Shows come from TMDB first and your provider fills any gaps."
 private const val TMDB_FOOTER_TV = TMDB_SYNC_SENTENCE +

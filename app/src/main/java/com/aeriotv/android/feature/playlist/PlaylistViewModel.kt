@@ -3583,8 +3583,9 @@ class PlaylistViewModel @Inject constructor(
      * recorded from it now. Zero keeps the plain confirmation.
      */
     suspend fun onDeviceRecordingCount(playlistId: String): Int =
-        repository.onDeviceRecordingCount(playlistId) +
-            if (com.aeriotv.android.feature.dvr.LocalRecordingService.isRecordingFor(playlistId)) 1 else 0
+        repository.onDeviceRecordingCount(
+            playlistId, capturingNow = com.aeriotv.android.feature.dvr.LocalRecordingService.isRecordingFor(playlistId),
+        )
 
     /** Delete a saved playlist by id. If the deleted row was the active one,
      * fall back to the most-recent remaining playlist (or NeedsUrl if none).
@@ -3595,6 +3596,10 @@ class PlaylistViewModel @Inject constructor(
         // playlist BEFORE the row is deleted; none of them may read or write
         // the deleted record afterward.
         com.aeriotv.android.core.data.repository.DeletedPlaylists.mark(playlistId)
+        // Nothing for it goes out from here on: its keys, its Xtream Codes
+        // and M3U URLs, and its hosts are refused now, before the first
+        // suspension (a DVR poll raced the delete by 0.1 s on the emulator).
+        repository.revokeNow(playlistId)
         cancelPlaylistTasks(playlistId)
         viewModelScope.launch {
             val wasActive = repository.activePlaylist()?.id == playlistId

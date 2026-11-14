@@ -315,7 +315,7 @@ numeric id or session token; reverse proxies usually need a wildcard there.
 | 4 | Login and account | `/api/accounts/users/` | admin check; a 2xx here proves the account is an admin (unlocks Switch Stream and server-side features); the user list for Add Profile and Channel Profiles (admin only) |
 | 5 | Login and account | `/api/accounts/users/<id>/` | `PATCH` with `channel_profiles` to assign a profile's Channel Profiles (admin only) |
 | 6 | Login and account | `/api/accounts/users/me/app-data/` | Lists AerioTV's synced data keys and sizes for the signed-in profile (Dispatcharr Sync) |
-| 7 | Login and account | `/api/accounts/users/me/app-data/<key>/` | Reads, saves, and clears one Dispatcharr Sync category (the key is `<username>.aeriotv`; older releases used `app.molinete.aerio`, moved once) |
+| 7 | Login and account | `/api/accounts/users/me/app-data/<key>/` | Reads, saves, and clears one Dispatcharr Sync category (the key is `<username>.aeriotv`) |
 | 8 | Login and account | `/api/accounts/api-keys/generate/` | `POST` with `user_id` to mint an API key for a user from Enable API access in Add Profile (admin only) |
 | 9 | Login and account | `/api/accounts/api-keys/revoke/` | `POST` with `user_id` to revoke that key when Enable API access is turned back off (admin only) |
 | 10 | Server | `/api/core/version/` | server version, also the connectivity and auth test at setup (older Dispatcharr builds: `/api/version/`) |
@@ -331,7 +331,7 @@ numeric id or session token; reverse proxies usually need a wildcard there.
 | 20 | Channels and guide | `/api/epg/grid/` | the bulk EPG window (about -1 h to +24 h) that fills the guide |
 | 21 | Channels and guide | `/api/epg/programs/` | program search and per-channel program lists beyond the grid window |
 | 22 | Channels and guide | `/api/epg/programs/<id>/` | one program's full detail (categories, rating) for the info sheet (tinted cards too on servers without the search below) |
-| 23 | Channels and guide | `/api/epg/programs/search/` | every program airing now, with categories, in one request (`airing_at`, `fields`, `page_size`), for tinted guide cards |
+| 23 | Channels and guide | `/api/epg/programs/search/` | every program airing now, with categories, in pages of up to 500 (`airing_at`, `fields`, `page_size`, `page`), for tinted guide cards |
 | 24 | Channels and guide | `/api/epg/current-programs/` | what is airing now on a set of channels (Live TV cards, Top Shelf) |
 | 25 | Channels and guide | `/api/epg/epgdata/` | the EPG channel rows that map tvg ids to EPG sources |
 | 26 | Channels and guide | `/api/epg/sources/` | the server's EPG sources, layered onto the guide |

@@ -2063,23 +2063,45 @@ fun MainScaffold(
                             .onSizeChanged {
                                 if (DockPlacement.containerWidth != it.width) DockPlacement.containerWidth = it.width
                             }
-                            .padding(bottom = 8.dp)
-                            // While the bar is (or is coming back) out, this
-                            // strip owns every touch in it. During the 420 ms
-                            // restore the bar is still scaled toward the pill,
-                            // and a tap where a tab will be fell through to the
-                            // screen underneath: a Settings tap started a
-                            // channel from the guide (Nothing Phone 2026-11-06).
-                            .then(
-                                if (bottomBarVisible) Modifier.pointerInput(Unit) {
-                                    awaitPointerEventScope {
-                                        while (true) {
-                                            awaitPointerEvent().changes.forEach { it.consume() }
-                                        }
-                                    }
-                                } else Modifier,
-                            ),
+                            .padding(bottom = 8.dp),
                     ) {
+                        // While the bar is (or is coming back) out, the bar's
+                        // own frame owns every touch in it. During the 420 ms
+                        // restore the bar is still scaled toward the pill,
+                        // and a tap where a tab will be fell through to the
+                        // screen underneath: a Settings tap started a channel
+                        // from the guide (Nothing Phone 2026-11-06). The
+                        // blocker is the bar's last measured frame, placed as
+                        // the bar is (top, centered): on a phone that is the
+                        // full width, as before; on a tablet the old strip
+                        // spanned the screen, and the Settings sidebar rows
+                        // beside the centered bar took no taps. Its own size,
+                        // not the bar's, so it is there from the restore's
+                        // first frame, before the scaled bar is composed (the
+                        // strip had no height then, and a tap fell through).
+                        // Below the bar, so its tabs still take their own.
+                        if (bottomBarVisible) {
+                            Box(
+                                Modifier
+                                    .then(
+                                        if (barSize.width > 0 && barSize.height > 0) {
+                                            Modifier
+                                                .align(Alignment.TopCenter)
+                                                .size(
+                                                    with(density) { barSize.width.toDp() },
+                                                    with(density) { barSize.height.toDp() },
+                                                )
+                                        } else Modifier.matchParentSize(),
+                                    )
+                                    .pointerInput(Unit) {
+                                        awaitPointerEventScope {
+                                            while (true) {
+                                                awaitPointerEvent().changes.forEach { it.consume() }
+                                            }
+                                        }
+                                    },
+                            )
+                        }
                         if (collapse < 0.999f) {
                             val pillW = with(density) { 64.dp.toPx() }
                             val pillH = with(density) { 52.dp.toPx() }
@@ -3387,24 +3409,23 @@ private fun SettingsTabContent(
         }
         playlistVm.consumeSettingsPage()
     }
-    // Watch for a playlist id flip while we're inside the Add Playlist flow;
-    // that means the user's onboarding Save succeeded and the new row was
-    // promoted active. Close the embedded flow.
+    // A successful add on the Configure step moves on, on the same one-shot
+    // event onboarding waits for (PlaylistViewModel.sourceConfigured, sent
+    // once the test has loaded channels). The flow used to wait for the
+    // active playlist id to change from the id it started with, so with no
+    // playlist yet (after Skip for now) the add succeeded and the form
+    // stayed up. Apple's Settings add moves on either way (AddServerView
+    // saveServer).
     var qrRestoreSignIn by remember { mutableStateOf<com.aeriotv.android.core.qr.QrImportBus.SignIn?>(null) }
     qrRestoreSignIn?.let { si ->
         com.aeriotv.android.feature.onboarding.QrRestoreOfferDialog(signIn = si, onClose = { qrRestoreSignIn = null })
     }
-    val startId = remember(addPlaylistStep) {
-        if (addPlaylistStep != AddPlaylistStep.None) playlistState.playlist?.id else null
-    }
-    LaunchedEffect(playlistState.playlist?.id) {
-        if (addPlaylistStep != AddPlaylistStep.None &&
-            startId != null &&
-            playlistState.playlist?.id != startId
-        ) {
-            val step = addPlaylistStep
-            val newId = playlistState.playlist?.id
-            if (step is AddPlaylistStep.Configure && newId != null &&
+    val configureStep = addPlaylistStep as? AddPlaylistStep.Configure
+    LaunchedEffect(configureStep) {
+        val step = configureStep ?: return@LaunchedEffect
+        playlistVm.sourceConfigured.collect {
+            val newId = playlistVm.state.value.playlist?.id
+            if (newId != null &&
                 (step.sourceType == com.aeriotv.android.core.data.SourceType.DispatcharrApiKey ||
                     step.sourceType == com.aeriotv.android.core.data.SourceType.DispatcharrUserPass)
             ) {
@@ -3460,7 +3481,11 @@ private fun SettingsTabContent(
         // lands on the Settings pill, preserving the pill -> DOWN -> list flow.
         val entering = subScreenKey != null
         val exitingToRoot = subScreenKey == null && prevSubScreenKey != null
-        if (entering || exitingToRoot) runCatching { settingsContentFocus.requestFocus() }
+        // TV only: phones and tablets have no selection-follows-focus nav to
+        // escape, and in touch mode the first node that takes focus is a text
+        // field, so the pull opened Edit Playlist with Name focused and the
+        // keyboard up (tablet emulator, 2026-11-14).
+        if (isTvDevice && (entering || exitingToRoot)) runCatching { settingsContentFocus.requestFocus() }
         prevSubScreenKey = subScreenKey
     }
     // Settings tab re-tap (TabReselect): pop whatever is pushed back to the

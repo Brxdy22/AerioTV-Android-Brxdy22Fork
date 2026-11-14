@@ -58,6 +58,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.runningFold
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -97,6 +98,8 @@ class DispatcharrSyncManager @Inject constructor(
     private val providersStore: com.aeriotv.android.core.sync.SyncProvidersStore,
     /** Rule 5: Drive follows and converges with Dispatcharr Sync (Provider: the two reference each other). */
     private val drive: Provider<com.aeriotv.android.core.sync.DriveSyncManager>,
+    private val tmdb: com.aeriotv.android.core.network.TMDBService,
+    private val cipher: com.aeriotv.android.core.security.CredentialCipher,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val state = context.getSharedPreferences("aerio_dsync", Context.MODE_PRIVATE)
@@ -233,6 +236,7 @@ class DispatcharrSyncManager @Inject constructor(
         registerNetworkCallback()
         watchBetweenSessions()
         scope.launch {
+            runCatching { sealSavedTmdbKeys() }.onFailure { Log.w(TAG, "[DSYNC] tmdbKey: sealing saved copies failed: ${it.javaClass.simpleName}") }
             combine(
                 prefs.dispatcharrSyncEnabled,
                 playlistDao.observeActive().map { rows -> rows.firstOrNull()?.takeIf { it.isDispatcharrDirectConnect() }?.id },
@@ -1122,18 +1126,81 @@ class DispatcharrSyncManager @Inject constructor(
     private fun k(name: String, s: Session, key: DsyncKey? = null) =
         "$name|${s.playlistId}|${s.profileKey}" + (key?.let { "|${it.suffix}" } ?: "")
 
-    private fun rawOf(s: Session, key: DsyncKey): JsonObject? =
-        state.getString(k("raw", s, key), null)?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+    // ---- the saved server copy at rest (section 4.13: the TMDB key is sealed) ----
 
-    private fun lastDataOf(s: Session, key: DsyncKey): String? = state.getString(k("data", s, key), null)
+    /** Seals a TMDB key for the state file; null when it cannot be (never the plain key). */
+    private val sealTmdb: (String) -> String? = { v ->
+        if (cipher.isEncrypted(v)) v else cipher.encrypt(v)?.takeIf { cipher.isEncrypted(it) }
+    }
+
+    /** Opens a sealed TMDB key (a plain value from an older build reads as is); null when it cannot be. */
+    private val openTmdb: (String) -> String? = { v -> cipher.decrypt(v) }
+
+    private fun parseObj(s: String?): JsonObject? =
+        s?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+
+    private fun rawOf(s: Session, key: DsyncKey): JsonObject? {
+        val raw = parseObj(state.getString(k("raw", s, key), null)) ?: return null
+        return if (key == DsyncKey.TmdbKey) DsyncAtRest.openCategory(raw, openTmdb) else raw
+    }
+
+    private fun lastDataOf(s: Session, key: DsyncKey): String? {
+        val stored = state.getString(k("data", s, key), null) ?: return null
+        if (key != DsyncKey.TmdbKey) return stored
+        return parseObj(stored)?.let { DsyncAtRest.openData(it, openTmdb) }?.toString()
+    }
+
+    /** The category's saved server copy; the tmdbKey copy is sealed, or not kept when it cannot be. */
+    private fun putRaw(e: android.content.SharedPreferences.Editor, s: Session, key: DsyncKey, raw: JsonObject) {
+        val stored = if (key == DsyncKey.TmdbKey) DsyncAtRest.sealCategory(raw, sealTmdb) else raw
+        if (stored == null) e.remove(k("raw", s, key)) else e.putString(k("raw", s, key), stored.toString())
+    }
+
+    private fun saveRaw(s: Session, key: DsyncKey, raw: JsonObject) {
+        val e = state.edit()
+        putRaw(e, s, key, raw)
+        e.apply()
+    }
 
     private fun saveAfter(s: Session, key: DsyncKey, raw: JsonObject, at: Long, dev: String, data: JsonObject) {
-        state.edit()
-            .putString(k("raw", s, key), raw.toString())
-            .putLong(k("at", s, key), at)
-            .putString(k("dev", s, key), dev)
-            .putString(k("data", s, key), data.toString())
-            .apply()
+        val e = state.edit()
+        putRaw(e, s, key, raw)
+        e.putLong(k("at", s, key), at)
+        e.putString(k("dev", s, key), dev)
+        val storedData = if (key == DsyncKey.TmdbKey) DsyncAtRest.sealData(data, sealTmdb) else data
+        if (storedData == null) e.remove(k("data", s, key)) else e.putString(k("data", s, key), storedData.toString())
+        e.apply()
+    }
+
+    /**
+     * Seals TMDB keys that an earlier build (49ab608e) saved in plain text in
+     * the state file: every saved bucket and the tmdbKey category's own
+     * copies. Runs once per launch before any session starts; a copy already
+     * sealed is left alone.
+     */
+    private fun sealSavedTmdbKeys() {
+        val e = state.edit()
+        var n = 0
+        state.all.forEach { (name, v) ->
+            val str = v as? String ?: return@forEach
+            val isBucket = name.startsWith("braw|")
+            val isRaw = name.startsWith("raw|") && name.endsWith("|${DsyncKey.TmdbKey.suffix}")
+            val isData = name.startsWith("data|") && name.endsWith("|${DsyncKey.TmdbKey.suffix}")
+            if (!isBucket && !isRaw && !isData) return@forEach
+            val obj = parseObj(str) ?: return@forEach
+            // sealTmdb leaves a sealed key as it is, so only plain keys change.
+            val sealed = when {
+                isBucket -> DsyncAtRest.sealBucket(obj, sealTmdb)
+                isRaw -> DsyncAtRest.sealCategory(obj, sealTmdb)
+                else -> DsyncAtRest.sealData(obj, sealTmdb)
+            }
+            val out = sealed?.toString()
+            if (out == str) return@forEach
+            if (out == null) e.remove(name) else e.putString(name, out)
+            n++
+        }
+        e.apply()
+        if (n > 0) Log.i(TAG, "[DSYNC] tmdbKey: sealed $n saved server copies")
     }
 
     /** Persistent (survives process death). [dirtyAt] = the last local change, Unix seconds. */
@@ -1184,11 +1251,13 @@ class DispatcharrSyncManager @Inject constructor(
     /** The server key for [b] in this session; empty before /me/ answered (every caller checks userKey first). */
     private fun wire(s: Session, b: DsyncBucket): String = b.wire(s.userKey.orEmpty())
 
+    /** The saved bucket, its TMDB key opened (section 4.13 at rest). */
     private fun bucketRaw(s: Session, b: DsyncBucket): JsonObject? =
-        state.getString(k("braw", s) + "|" + b.name, null)?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+        parseObj(state.getString(k("braw", s) + "|" + b.name, null))?.let { DsyncAtRest.openBucket(it, openTmdb) }
 
+    /** Saves the bucket with its TMDB key sealed, never in plain text. */
     private fun saveBucketRaw(s: Session, b: DsyncBucket, raw: JsonObject) {
-        state.edit().putString(k("braw", s) + "|" + b.name, raw.toString()).apply()
+        state.edit().putString(k("braw", s) + "|" + b.name, DsyncAtRest.sealBucket(raw, sealTmdb).toString()).apply()
     }
 
     private suspend fun pullAll(s: Session, reason: String) = s.mutex.withLock {
@@ -1426,9 +1495,17 @@ class DispatcharrSyncManager @Inject constructor(
             s.read += key
             return
         }
-        val wins = DsyncEnvelopeCodec.remoteWins(localAt, localDev, env.updatedAt, env.deviceId)
+        // tmdbKey (section 4.13): its stamp is the key's edit time, so every
+        // copy other than the one last consumed is weighed by edit time in
+        // apply (tmdbKeepsLocal), never skipped as not newer than a stamp seen
+        // before and never held back by an unsent change's queue time.
+        val tmdb = key == DsyncKey.TmdbKey
+        val wins = if (tmdb) {
+            DsyncPayloads.tmdbPullApplies(env.updatedAt, env.deviceId, env.data, localAt, localDev, rawOf(s, key)?.get("data") as? JsonObject)
+        } else DsyncEnvelopeCodec.remoteWins(localAt, localDev, env.updatedAt, env.deviceId)
         // profiles merges per row on every pull; the rows carry their own updatedAt.
         val decision = if (key == DsyncKey.Profiles) DsyncGate.DirtyPull.Merge
+        else if (tmdb) DsyncGate.DirtyPull.TakeRemote
         else DsyncGate.onNewerPull(key, isDirty(s, key), dirtyAt(s, key), env.updatedAt)
         if (key == DsyncKey.Profiles || (wins && decision == DsyncGate.DirtyPull.Merge)) {
             val merged = runCatching { mergedEnvelope(s, key, env) }
@@ -1473,7 +1550,7 @@ class DispatcharrSyncManager @Inject constructor(
             return
         }
         if (wins && decision == DsyncGate.DirtyPull.KeepLocal) {
-            state.edit().putString(k("raw", s, key), raw.toString()).apply()
+            saveRaw(s, key, raw)
             Log.i(TAG, "[DSYNC] pull ${key.suffix} bytes=$bytes kept local (local change newer)")
             s.read += key
             return
@@ -1502,7 +1579,7 @@ class DispatcharrSyncManager @Inject constructor(
             }
         } else {
             // Keep the newest raw for round-trip and the row merges.
-            state.edit().putString(k("raw", s, key), raw.toString()).apply()
+            saveRaw(s, key, raw)
             Log.i(TAG, "[DSYNC] pull ${key.suffix} bytes=$bytes not newer")
             if (key == DsyncKey.Progress) runCatching { retryHeldProgress(s, env) }
                 .onFailure { Log.w(TAG, "[DSYNC] progress held retry failed: ${it.javaClass.simpleName}") }
@@ -1725,9 +1802,22 @@ class DispatcharrSyncManager @Inject constructor(
             refreshMessage(s)
             return
         }
-        val sub = DsyncV2.encodeCategory(raw, deviceId, now, data)
+        // The TMDB key goes up stamped with its own edit time, not the push
+        // time (section 4.13, owner 2026-11-13): an older edit sent late must
+        // not beat a newer one. Every other category keeps the push time.
+        val editedAt = if (key == DsyncKey.TmdbKey) prefs.tmdbApiKeyState.first().editedAt else 0L
+        val stamp = DsyncPayloads.categoryStamp(key, now, editedAt)
+        if (key == DsyncKey.TmdbKey) {
+            // Never the key, only whether it is set and which time it carries.
+            val set = !DsyncPayloads.decodeTMDBKey(data).isNullOrEmpty()
+            Log.i(TAG, "[DSYNC] tmdbKey: sending the ${if (set) "key" else "clear"} stamped ${if (editedAt > 0) "with its edit time" else "with the push time (edit time unknown)"} at=$stamp")
+        }
+        val sub = DsyncV2.encodeCategory(raw, deviceId, stamp, data)
         // No byte guard before the PUT: send the full value; trim only on a 413.
-        var value = DsyncV2.encodeBucket(bucketRaw(s, b), deviceId, BuildConfig.VERSION_NAME, now, mapOf(key to sub))
+        // The copy refreshBeforePut just fetched (in memory) carries every other
+        // category, the TMDB key included, exactly as the server holds it; the
+        // saved copy is the fallback when the server had none.
+        var value = DsyncV2.encodeBucket(s.fetchedRaw[wire(s, b)] ?: bucketRaw(s, b), deviceId, BuildConfig.VERSION_NAME, now, mapOf(key to sub))
         value = withProviders(s, value)
         // Roster paused: `profiles` goes up exactly as the server holds it now
         // (or not at all), never local rows or a copy saved from an earlier server.
@@ -1834,6 +1924,7 @@ class DispatcharrSyncManager @Inject constructor(
         if (force) return Refresh.Ok
         val at = state.getLong(k("at", s, key), 0L)
         val dev = state.getString(k("dev", s, key), "").orEmpty()
+        if (key == DsyncKey.TmdbKey) return tmdbBeforePut(s, key, env, at, dev)
         if (env.updatedAt == at && env.deviceId == dev && (rawOf(s, key)?.get("data") as? JsonObject) == env.data) return Refresh.Ok
         if (ProfileScope.token.value != s.token) return Refresh.Unreachable
         if (key in DsyncGate.ROW_MERGE_KEYS || key == DsyncKey.Profiles) {
@@ -1848,7 +1939,7 @@ class DispatcharrSyncManager @Inject constructor(
         if (!DsyncEnvelopeCodec.remoteWins(at, dev, env.updatedAt, env.deviceId)) return Refresh.Ok
         return when (DsyncGate.onNewerPull(key, isDirty(s, key), dirtyAt(s, key), env.updatedAt)) {
             DsyncGate.DirtyPull.KeepLocal -> {
-                state.edit().putString(k("raw", s, key), env.raw.toString()).apply()
+                saveRaw(s, key, env.raw)
                 Refresh.Ok
             }
             else -> {
@@ -1861,6 +1952,29 @@ class DispatcharrSyncManager @Inject constructor(
                 Refresh.RemoteTook
             }
         }
+    }
+
+    /**
+     * tmdbKey before a PUT (section 4.13): newest edit wins, by the key's own
+     * edit time. A server copy this device has not consumed is weighed
+     * against this device's edit whatever its stamp, so an older edit is
+     * never sent over a newer one (the dirty time is when the send was
+     * queued, not when the key was edited).
+     */
+    private suspend fun tmdbBeforePut(s: Session, key: DsyncKey, env: DsyncEnvelope, at: Long, dev: String): Refresh {
+        if (DsyncPayloads.tmdbSameAsConsumed(env.updatedAt, env.deviceId, env.data, at, dev, rawOf(s, key)?.get("data") as? JsonObject)) return Refresh.Ok
+        if (ProfileScope.token.value != s.token) return Refresh.Unreachable
+        // A malformed server copy is replaced by this device's.
+        val remote = DsyncPayloads.decodeTMDBKey(env.data) ?: return Refresh.Ok
+        val local = prefs.tmdbApiKeyState.first()
+        if (DsyncPayloads.tmdbSendsLocal(local.key.trim(), remote, local.editedAt, env.updatedAt)) return Refresh.Ok
+        val applied = runCatching { apply(s, key, env) }.getOrDefault(ApplyResult.Failed)
+        if (applied != ApplyResult.Applied) return Refresh.Unreachable
+        s.suppressUntil[key] = System.currentTimeMillis() + SUPPRESS_MS
+        saveAfter(s, key, env.raw, env.updatedAt, env.deviceId, env.data)
+        setDirty(s, key, false)
+        Log.i(TAG, "[DSYNC] tmdbKey: the server's edit is newer than this device's; applied it instead of sending")
+        return Refresh.RemoteTook
     }
 
     private suspend fun put(s: Session, c: Conn, b: DsyncBucket, key: DsyncKey, value: JsonObject, data: JsonObject): PutStatus? {
@@ -1914,7 +2028,23 @@ class DispatcharrSyncManager @Inject constructor(
         DsyncKey.RadioDefault -> prefs.radioModeByDefault
         DsyncKey.Collections -> prefs.channelCollections
         DsyncKey.Profiles -> combine(profileStore.profiles, pinStore.changes) { p, v -> p.map { listOf(it.username, it.displayName) } to v }
+        DsyncKey.TmdbKey -> tmdbEdits()
     }
+
+    /**
+     * Section 4.13: a count that rises with each save or clear of the TMDB
+     * key on this device. Detection reads a SHA-256 digest of the key, never
+     * the key. A key restored another way (an older Drive snapshot) is not an
+     * edit here, and an apply from a pull (this sync's or Google Drive's) is
+     * marked as a sync's write and is not an edit either.
+     */
+    private fun tmdbEdits(): Flow<Int> = prefs.tmdbApiKeyState
+        .map { DsyncPayloads.TmdbLocal(DsyncPayloads.tmdbDigest(it.key), it.editedAt, it.fromSync) }
+        .distinctUntilChanged()
+        .runningFold(0 to (null as DsyncPayloads.TmdbLocal?)) { (n, prev), cur ->
+            (if (DsyncPayloads.tmdbIsEdit(prev, cur)) n + 1 else n) to cur
+        }
+        .map { it.first }
 
     // ---- channel id mapping (schema 4: Dispatcharr channel `id` int) ----
 
@@ -2199,6 +2329,12 @@ class DispatcharrSyncManager @Inject constructor(
             }
         }
         DsyncKey.RadioDefault -> DsyncPayloads.encodeRadioDefault(base, prefs.radioModeByDefaultIn(s.token))
+        DsyncKey.TmdbKey -> {
+            // A device with no key never starts the category: a fresh "" would
+            // read as a clear newer than every other device's key.
+            val apiKey = prefs.tmdbApiKey.first().trim()
+            if (apiKey.isEmpty() && base == null) null else DsyncPayloads.encodeTMDBKey(base, apiKey)
+        }
         DsyncKey.Collections -> {
             val m = channelMap(s)
             val n = prefs.channelCollectionsIn(s.token).size
@@ -2741,6 +2877,24 @@ class DispatcharrSyncManager @Inject constructor(
             DsyncKey.RadioDefault -> {
                 val on = DsyncPayloads.decodeRadioDefault(d) ?: return ApplyResult.Malformed
                 prefs.setRadioModeByDefaultIn(on, s.token)
+            }
+            DsyncKey.TmdbKey -> {
+                // Never logs the key, only whether it is set.
+                val remote = DsyncPayloads.decodeTMDBKey(d) ?: return ApplyResult.Malformed
+                val (stored, editedAt) = prefs.tmdbApiKeyState.first()
+                val local = stored.trim()
+                if (DsyncPayloads.tmdbKeepsLocal(local, remote, editedAt, env.updatedAt)) {
+                    Log.i(TAG, "[DSYNC] tmdbKey: kept this device's ${if (local.isEmpty()) "clear" else "key"} (newer than the server's ${if (remote.isEmpty()) "clear" else "key"}); sending it")
+                    setDirty(s, key, true)
+                    schedule(s, key, 0L)
+                } else if (local != remote) {
+                    // Applying a pull is not an edit here: the change watcher skips it.
+                    s.suppressUntil[key] = System.currentTimeMillis() + SUPPRESS_MS
+                    prefs.setTmdbApiKeyFromSync(remote, env.updatedAt)
+                    // As Save in Settings does: lookups (misses included) were keyed to the old key.
+                    tmdb.clearCache()
+                    Log.i(TAG, "[DSYNC] tmdbKey: ${if (remote.isEmpty()) "cleared" else "set"} from the server")
+                }
             }
             DsyncKey.Collections -> {
                 val rows = DsyncPayloads.decodeCollections(d) ?: return ApplyResult.Malformed

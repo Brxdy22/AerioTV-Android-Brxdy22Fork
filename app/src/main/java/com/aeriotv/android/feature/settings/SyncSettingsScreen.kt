@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -304,7 +305,10 @@ fun SyncSettingsScreen(
                 top = 12.dp,
                 bottom = LocalTabBarBottomInset.current,
             ),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            // Phones and tablets: the shared section spacing (Apple's rhythm).
+            verticalArrangement = Arrangement.spacedBy(
+                com.aeriotv.android.ui.settings.settingsSectionSpacing(com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing),
+            ),
         ) {
             // Touch only: Android TV opens on the GOOGLE DRIVE eyebrow, as
             // Apple TV opens on ICLOUD; its account row already says
@@ -932,10 +936,11 @@ private fun SignOutButton(busy: Boolean, onClick: () -> Unit) {
  * system font, so this uses the system sans-serif (Roboto) in medium.
  * On TV, focus draws AerioTV's ring around the button, outside it, and the
  * button's own colors never change; on touch a press shows the standard
- * ripple.
+ * ripple. The one Google sign-in button: Settings > Sync and the onboarding
+ * Drive offer (DriveBackupOfferStepScreen) both draw this.
  */
 @Composable
-private fun GoogleSignInButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+internal fun GoogleSignInButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
     val tv = rememberIsTvDevice()
     var focused by remember { mutableStateOf(false) }
     val pill = RoundedCornerShape(50)
@@ -1073,6 +1078,7 @@ private fun SyncTileToggleRow(
         onClick = { if (enabled) onCheckedChange(!checked) },
         // Apple dims disabled category rows to 50% rather than hiding them.
         modifier = Modifier.alpha(if (enabled) 1f else 0.5f),
+        pressFeedback = enabled,
     ) {
         SyncIconTile(icon, MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(syncTileGap()))
@@ -1107,7 +1113,7 @@ private fun SyncTileActionRow(
     chevron: Boolean = false,
 ) {
     val tint = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-    SettingsRowContainer(onClick = { if (!running) onClick() }) {
+    SettingsRowContainer(onClick = { if (!running) onClick() }, pressFeedback = !running) {
         SyncIconTile(icon, tint)
         Spacer(Modifier.width(syncTileGap()))
         SyncRowText(
@@ -1243,7 +1249,10 @@ fun SyncCategoriesScreen(
                     top = 12.dp,
                     bottom = LocalTabBarBottomInset.current,
                 ),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                // Phones and tablets: the shared section spacing (Apple's rhythm).
+                verticalArrangement = Arrangement.spacedBy(
+                    com.aeriotv.android.ui.settings.settingsSectionSpacing(com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing),
+                ),
             ) {
                 // Every synced option is its own row (owner decision 2026-10-27).
                 // Settings rows take a scope from this device's class only
@@ -1317,7 +1326,15 @@ fun SyncCategoriesScreen(
                         }
                     }
                 } else {
-                    item { SettingsSectionFooter(footer) }
+                    // Its own item after the last group: on phones and tablets it
+                    // draws a section spacing higher, at a footer's distance
+                    // below that group's card.
+                    item {
+                        SettingsSectionFooter(
+                            footer,
+                            if (isTv) Modifier else Modifier.offset(y = -com.aeriotv.android.ui.settings.SettingsCardMetrics.sectionSpacing),
+                        )
+                    }
                 }
             }
         }

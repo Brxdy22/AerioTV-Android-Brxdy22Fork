@@ -265,6 +265,22 @@ data class CredentialsSnapshotEntry(
 data class CredentialsSnapshot(
     val envelope: SyncEnvelope,
     val entries: List<CredentialsSnapshotEntry>,
+    /**
+     * The TMDB API key (2026-11-13): one key per device, not per playlist, as
+     * entered and trimmed; "" = cleared. Null in older files and when no
+     * device has set or cleared a key. Same trust model as the entries. It
+     * follows Google Drive Sync itself, not the Credentials item (Option A):
+     * with that item off, only this field and [tmdbUpdatedAt] are read and
+     * written, and the entries are left as Drive has them. Older readers
+     * ignore it.
+     */
+    val tmdbKey: String? = null,
+    /**
+     * When [tmdbKey] was last saved or cleared, Unix milliseconds (the
+     * writer's TMDB edit time). The newest edit wins, by the same rule as
+     * Dispatcharr Sync (DsyncPayloads.tmdbKeepsLocal). 0 or null = unknown.
+     */
+    val tmdbUpdatedAt: Long? = null,
 )
 
 // Live views: the rows a snapshot carries without its tombstones (removedAt),

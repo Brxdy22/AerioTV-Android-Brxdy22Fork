@@ -90,6 +90,9 @@ class LanReachability @Inject constructor(
         return refresh(key)
     }
 
+    /** The last verdict for [lanUrl] without probing; null when never probed. */
+    fun cachedVerdict(lanUrl: String): Boolean? = verdicts[lanUrl.trim().trimEnd('/')]
+
     /** Force a fresh probe of [lanUrl] (playlist edits, network changes). */
     suspend fun refresh(lanUrl: String): Boolean {
         val key = lanUrl.trimEnd('/')
@@ -156,6 +159,8 @@ class LanReachability @Inject constructor(
             Log.i(TAG, "LAN probe $baseUrl -> cellular-only transport, skipping HEAD (WAN)")
             return@withContext false
         }
+        // A deleted playlist's address is never probed (playlist delete cutoff).
+        if (PlaylistRevocation.refusal(baseUrl, null) != null) return@withContext false
         try {
             val conn = URL(baseUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "HEAD"

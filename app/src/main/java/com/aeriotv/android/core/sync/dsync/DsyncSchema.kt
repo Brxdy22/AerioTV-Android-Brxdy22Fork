@@ -24,7 +24,12 @@ import kotlinx.serialization.json.longOrNull
  */
 enum class DsyncKey(
     val suffix: String,
-    /** Which existing Sync Categories toggle gates this key; null = always (profiles). */
+    /**
+     * Which existing Sync Categories toggle gates this key; null = always
+     * (profiles, and tmdbKey, which syncs whenever Dispatcharr Sync is on;
+     * Google Drive carries it separately, in the Credentials file: schema
+     * section 4.13).
+     */
     val category: SyncCategory?,
     val schemaVersion: Int = 1,
 ) {
@@ -41,6 +46,7 @@ enum class DsyncKey(
     RadioDefault("radioDefault", SyncCategory.Preferences),
     Collections("collections", SyncCategory.Favorites),
     Profiles("profiles", null),
+    TmdbKey("tmdbKey", null),
     ;
 
     val wire: String get() = PREFIX + suffix
@@ -511,6 +517,113 @@ object DsyncPayloads {
     }
     fun encodeRadioDefault(base: JsonObject?, on: Boolean): JsonObject = base.with("on" to JsonPrimitive(on))
 
+    // tmdbKey (section 4.13): the user's TMDB API key or read access token,
+    // trimmed; "" (or a missing member) = no key, so clearing syncs too.
+    // A non-string apiKey is malformed.
+    fun decodeTMDBKey(data: JsonObject): String? {
+        val v = data["apiKey"] ?: return ""
+        return v.asStr()?.trim()
+    }
+    fun encodeTMDBKey(base: JsonObject?, key: String): JsonObject = base.with("apiKey" to JsonPrimitive(key.trim()))
+
+    /**
+     * Newest edit wins for the TMDB key, checked when a newer remote value
+     * arrives (section 4.13): true = keep this device's key and send it.
+     * [localEditedAt] is when the key was last set or cleared on this
+     * device by its user, or applied from the server (Unix seconds; 0 =
+     * unknown: set before this build, or restored from an older Drive
+     * snapshot). With an unknown time a key beats a clear, so a stale clear
+     * on the server never wipes a key.
+     */
+    fun tmdbKeepsLocal(local: String, remote: String, localEditedAt: Long, remoteAt: Long): Boolean {
+        if (local == remote) return false
+        if (localEditedAt > 0) return localEditedAt > remoteAt
+        return remote.isEmpty() && local.isNotEmpty()
+    }
+
+    /**
+     * A pushed category's `updatedAt` (Unix seconds; section 4.13, owner
+     * 2026-11-13, Apple dce5791). The tmdbKey category carries the key's own
+     * edit time ([tmdbEditedAt]: when it was set or cleared on this device, or
+     * the stamp of the copy it was applied from), so an older edit sent late
+     * never outranks a newer edit made on another device. The push time stands
+     * in only while that edit time is unknown (0). Every other category, and
+     * the bucket's own `updatedAt`, keep the push time.
+     */
+    fun categoryStamp(key: DsyncKey, pushedAt: Long, tmdbEditedAt: Long): Long =
+        if (key == DsyncKey.TmdbKey && tmdbEditedAt > 0) tmdbEditedAt else pushedAt
+
+    /**
+     * tmdbKey: the server copy is the very one this device last consumed:
+     * the same stamp, the same device, and the same key while the saved copy
+     * still holds it ([consumedData]; a copy whose key could not be kept at
+     * rest compares by stamp and device). The stamp is the key's edit time,
+     * so a copy sent later can carry an older stamp than one consumed before;
+     * that copy is not the consumed one and is weighed by edit time.
+     */
+    fun tmdbSameAsConsumed(
+        remoteAt: Long,
+        remoteDevice: String,
+        remoteData: JsonObject,
+        consumedAt: Long,
+        consumedDevice: String,
+        consumedData: JsonObject?,
+    ): Boolean {
+        if (remoteAt != consumedAt || remoteDevice != consumedDevice) return false
+        val held = consumedData ?: return true
+        if (!held.containsKey("apiKey")) return true
+        return decodeTMDBKey(held) == decodeTMDBKey(remoteData)
+    }
+
+    /**
+     * tmdbKey on a pull: every copy other than the one last consumed goes to
+     * apply, which weighs it by edit time ([tmdbKeepsLocal]: keep and resend
+     * a newer local edit, or take the server's key with its stamp). Never
+     * skipped as not newer than a stamp seen before, and never held back by
+     * an unsent change's queue time.
+     */
+    fun tmdbPullApplies(
+        remoteAt: Long,
+        remoteDevice: String,
+        remoteData: JsonObject,
+        consumedAt: Long,
+        consumedDevice: String,
+        consumedData: JsonObject?,
+    ): Boolean = !tmdbSameAsConsumed(remoteAt, remoteDevice, remoteData, consumedAt, consumedDevice, consumedData)
+
+    /**
+     * tmdbKey, just before a PUT, when the server copy is not the one this
+     * device last consumed: true sends this device's key; false takes the
+     * server's (its edit is newer). Decided by edit time like a pull
+     * ([tmdbKeepsLocal]), never by the time the change was queued.
+     */
+    fun tmdbSendsLocal(local: String, remote: String, localEditedAt: Long, remoteAt: Long): Boolean =
+        local == remote || tmdbKeepsLocal(local, remote, localEditedAt, remoteAt)
+
+    /** Change detection for the TMDB key: a SHA-256 digest (lowercase hex), never the key itself. */
+    fun tmdbDigest(key: String): String =
+        MessageDigest.getInstance("SHA-256").digest(key.trim().toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+
+    /**
+     * The TMDB key as this device holds it, for change detection: its
+     * [digest], last edit time ([editedAt], Unix seconds), and whether that
+     * write was a sync's apply ([fromSync]).
+     */
+    data class TmdbLocal(val digest: String, val editedAt: Long, val fromSync: Boolean = false)
+
+    /**
+     * Whether the step from [prev] to [cur] is an edit made on this device.
+     * A save or clear in the TMDB field writes the key and its edit time
+     * together, so both change. A key that arrives another way is not an
+     * edit here: a restore from an older Drive snapshot changes the key
+     * alone, and a key applied from Google Drive's Credentials file or from
+     * Dispatcharr Sync is marked [TmdbLocal.fromSync] (its time is the
+     * source's, so sending it on as an edit here would beat a newer edit
+     * made elsewhere). Saving the same key again changes nothing to send.
+     */
+    fun tmdbIsEdit(prev: TmdbLocal?, cur: TmdbLocal): Boolean =
+        prev != null && !cur.fromSync && prev.digest != cur.digest && prev.editedAt != cur.editedAt
+
     // collections
     fun decodeCollections(data: JsonObject): List<CollectionRow>? = rows(data)?.map { el ->
         val r = el as? JsonArray ?: return null
@@ -833,7 +946,7 @@ object DsyncCoexistence {
 
     /**
      * Rule 4: the keys a "user chose Google Drive" replace pushes whole from
-     * local. Profiles (per-row merge), remoteMap, and radioDefault are excluded.
+     * local. Profiles (per-row merge), remoteMap, radioDefault, and tmdbKey are excluded.
      */
     /**
      * Pull before replace (section 10a): during the setup choice pull a shared
@@ -891,7 +1004,7 @@ object DsyncCoexistence {
      * (DriveFileMappingTest), never falls through to a default.
      */
     fun driveFileFor(key: DsyncKey): SyncCategory? = when (key) {
-        DsyncKey.Profiles -> null
+        DsyncKey.Profiles, DsyncKey.TmdbKey -> null
         DsyncKey.RemoteMap, DsyncKey.RadioDefault -> SyncCategory.Preferences
         else -> com.aeriotv.android.core.sync.SetupSourceChoice.driveFile(key.suffix)
             ?: error("no Drive file for ${key.suffix}")
@@ -1007,7 +1120,7 @@ object DsyncManual {
      * The shared keys a manual push or pull covers: every forced-replace key
      * whose Sync Categories item is not Off. `settings` is always included
      * (its lanes are gated per name, so an all-Off device writes nothing).
-     * Profiles, remoteMap, and radioDefault are never forced.
+     * Profiles, remoteMap, radioDefault, and tmdbKey are never forced.
      */
     fun keys(scopes: Map<String, com.aeriotv.android.core.sync.SyncScope>): List<DsyncKey> =
         DsyncCoexistence.FORCE_KEYS.filter { key ->

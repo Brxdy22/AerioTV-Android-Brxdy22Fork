@@ -149,6 +149,20 @@ object ForceHls {
     fun isSessionUrl(url: String): Boolean =
         url.contains(SESSION_MARKER, ignoreCase = true) && url.contains("index.m3u8", ignoreCase = true)
 
+    /**
+     * True when [entryUrl] redirected to a session playlist the player may
+     * adopt with the server's sign-in headers: same host and port, no
+     * https-to-http downgrade ([RedirectAuthRule]), or on the active
+     * playlist's current address (an entry URL from before a move is rebuilt
+     * there, StreamAddresses). A session-shaped URL anywhere else is a
+     * provider's (a Redirect stream profile), never the server's own.
+     */
+    fun isServerSession(entryUrl: String, landedUrl: String): Boolean =
+        isSessionUrl(landedUrl) && (
+            com.aeriotv.android.core.network.RedirectAuthRule.keepsSignIn(entryUrl, landedUrl) ||
+                com.aeriotv.android.core.network.StreamAddresses.isActiveServerUrl(landedUrl)
+            )
+
     private const val SESSION_MARKER = "/proxy/hls/"
     const val TOKEN_HEADER = "X-Dispatcharr-Session-Token"
 
@@ -163,6 +177,9 @@ object ForceHls {
             .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
             // The session resolve is a stream open too (StreamGate).
             .addInterceptor(StreamGate.interceptor)
+            // An entry URL from before the playlist moved is rebuilt on its
+            // current address, or sent without the key (StreamAddresses).
+            .let(com.aeriotv.android.core.network.StreamAddresses::install)
             .build()
     }
 
@@ -182,9 +199,16 @@ object ForceHls {
                 val token = resp.header(TOKEN_HEADER)
                 if (resp.code in 300..399 && location != null) {
                     val absolute = resp.request.url.resolve(location)?.toString()
-                    if (absolute != null && isSessionUrl(absolute)) {
+                    // The session is played and ended with the server's sign-in
+                    // headers, so only one on the server's own host is adopted.
+                    if (absolute != null && isServerSession(entryUrl, absolute)) {
                         Log.i(TAG, "[FORCE-HLS] entry 302 -> $absolute token=${token?.take(8) ?: "none"}")
                         Session(absolute, token)
+                    } else if (absolute != null && isSessionUrl(absolute)) {
+                        // A provider's playlist (Redirect profile): the plain TS
+                        // path follows it without the headers (GH #159 sniff).
+                        markNotHls(entryUrl, "302 to a session playlist on another host")
+                        null
                     } else {
                         Log.w(TAG, "[FORCE-HLS] entry 302 went to a non-HLS target $absolute")
                         if (absolute != null) {
@@ -272,7 +296,9 @@ class ServerHlsGuard(
         val req = dataSpec.uri.toString()
         if (ForceHls.isDispatcharrLive(req) && !ForceHls.isForcedHlsUrl(req)) {
             val landed = upstream.uri?.toString()
-            if (landed != null && ForceHls.isSessionUrl(landed)) {
+            // Adopted sessions play with the server's sign-in headers: never
+            // one on another host (RedirectAuthRule).
+            if (landed != null && ForceHls.isServerSession(req, landed)) {
                 ForceHls.noteServerHls(req, landed)
                 try { upstream.close() } catch (_: Exception) {}
                 throw ServerHlsRedirectException(req, landed)

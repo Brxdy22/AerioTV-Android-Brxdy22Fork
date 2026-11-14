@@ -197,6 +197,84 @@ class PlaylistRepository @Inject constructor(
     private val profileManager: javax.inject.Provider<com.aeriotv.android.core.profiles.ProfileManager>,
 ) {
 
+    // ---- Playlist delete cutoff: keys, Xtream Codes and M3U URLs, hosts (Apple 17f1d07) ----
+
+    /** The playlists as last read, so a delete can refuse its traffic at once, before any suspension. */
+    @Volatile private var playlistSnapshot: List<PlaylistEntity> = emptyList()
+    private val revocationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        // Stream requests carry a playlist's sign-in only to its current
+        // addresses; a URL from before a move is rebuilt on the current
+        // Local URL when its last probe reached it (StreamAddresses).
+        com.aeriotv.android.core.network.StreamAddresses.lanVerdict = { lanReachability.cachedVerdict(it) }
+        // Every write to the playlist table (an add, a setup from another
+        // device, a restore, an edit) lifts the deleted entries it matches.
+        // A row whose delete is under way is not "in use".
+        revocationScope.launch {
+            dao.observeAll().collect { rows ->
+                playlistSnapshot = rows
+                val live = rows.filterNot { DeletedPlaylists.isDeleted(it.id) }
+                com.aeriotv.android.core.network.PlaylistRevocation.lift(live.map { fingerprintOf(it) })
+                // The rows come with the active profile's sign-in laid over
+                // them; the stored rows give each playlist's own key.
+                val own = runCatching {
+                    kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) { dao.allOnce() }
+                }.getOrDefault(emptyList()).associate { it.id to it.apiKey }
+                com.aeriotv.android.core.network.StreamAddresses.update(live.map { streamAddressesOf(it, own[it.id]) })
+            }
+        }
+    }
+
+    /** A saved playlist's current addresses and the sign-ins its stream requests carry; [ownKey] is its stored key. */
+    private fun streamAddressesOf(row: PlaylistEntity, ownKey: String?): com.aeriotv.android.core.network.StreamAddresses.Entry {
+        val f = fingerprintOf(row)
+        val own = ownKey?.trim()?.takeIf { it.isNotEmpty() }
+        val xtream = row.sourceType == SourceType.XtreamCodes.name
+        return com.aeriotv.android.core.network.StreamAddresses.Entry(
+            playlistId = row.id,
+            serverUrl = row.urlString,
+            lanUrl = row.lanUrlString,
+            keys = f.keys + listOfNotNull(own),
+            xtreamUser = row.username.takeIf { xtream },
+            xtreamPass = row.password.takeIf { xtream },
+            active = row.isActive,
+            ownKey = own,
+        )
+    }
+
+    private fun fingerprintOf(row: PlaylistEntity): com.aeriotv.android.core.network.PlaylistFingerprint =
+        com.aeriotv.android.core.network.PlaylistFingerprint.of(
+            playlistId = row.id,
+            sourceType = row.sourceType,
+            url = row.urlString,
+            lanUrl = row.lanUrlString,
+            epgUrl = row.epgUrl,
+            apiKey = row.apiKey,
+            username = row.username,
+            password = row.password,
+            profileKeys = runCatching { profileManager.get().profileKeys(row.id) }.getOrDefault(emptyList()),
+        )
+
+    /**
+     * Refuses [playlistId]'s traffic from now on: its keys, its profiles'
+     * keys, its Xtream Codes and M3U URL secrets, and its hosts, minus
+     * whatever another playlist here still uses. Synchronous (in-memory
+     * reads only), so it takes effect before the delete's first suspension;
+     * [row] adds the stored row when the caller has read it.
+     */
+    fun revokeNow(playlistId: String, row: PlaylistEntity? = null) {
+        val rows = playlistSnapshot
+        val pm = runCatching { profileManager.get() }.getOrNull()
+        val mine = listOfNotNull(rows.firstOrNull { it.id == playlistId }, row).map { fingerprintOf(it) }
+            .fold(com.aeriotv.android.core.network.PlaylistFingerprint(playlistId, keys = pm?.profileKeys(playlistId).orEmpty().toSet())) { acc, f ->
+                acc.copy(keys = acc.keys + f.keys, urlSecrets = acc.urlSecrets + f.urlSecrets, hosts = acc.hosts + f.hosts)
+            }
+        val others = rows.filter { it.id != playlistId && !DeletedPlaylists.isDeleted(it.id) }.map { fingerprintOf(it) } +
+            com.aeriotv.android.core.network.PlaylistFingerprint("profiles", keys = pm?.profileKeysOutside(playlistId).orEmpty())
+        com.aeriotv.android.core.network.PlaylistRevocation.revoke(mine.minus(others))
+    }
+
     /** Last successful cast-profile re-resolve per playlist id, so the launch
      *  and foreground triggers coalesce to one lookup per 15 minutes. */
 
@@ -772,6 +850,22 @@ class PlaylistRepository @Inject constructor(
          */
         onPlan: ((SavePlan) -> Unit)? = null,
     ): Result<Pair<PlaylistEntity, List<M3UChannel>>> {
+        // Signing in to a deleted playlist again (the same server, key, or
+        // Xtream Codes or M3U URL) lifts its cutoff before anything is sent.
+        com.aeriotv.android.core.network.PlaylistRevocation.lift(
+            listOf(
+                com.aeriotv.android.core.network.PlaylistFingerprint.of(
+                    playlistId = existingId.orEmpty(),
+                    sourceType = saveRequest.sourceType.name,
+                    url = saveRequest.url,
+                    lanUrl = saveRequest.lanUrl,
+                    epgUrl = saveRequest.epgUrl,
+                    apiKey = saveRequest.apiKey,
+                    username = saveRequest.username,
+                    password = saveRequest.password,
+                ),
+            ),
+        )
         // A new address for an existing playlist: profile sign-ins are held
         // before this save sends anything (A-APP-1).
         val (request, routeMoved) = try {
@@ -4406,8 +4500,13 @@ class PlaylistRepository @Inject constructor(
      * On-device recordings that came from [playlistId] (local captures and
      * Save to Device copies, every profile): the delete prompt's count.
      */
-    suspend fun onDeviceRecordingCount(playlistId: String): Int =
-        runCatching { database.localRecordingDao().allForPlaylist(playlistId).size }.getOrDefault(0)
+    /** The delete prompt's count: its rows, and a running capture only when it has no row yet. */
+    suspend fun onDeviceRecordingCount(playlistId: String, capturingNow: Boolean = false): Int =
+        runCatching {
+            com.aeriotv.android.feature.dvr.InterruptedCapture.promptCount(
+                database.localRecordingDao().allForPlaylist(playlistId).map { it.status }, capturingNow,
+            )
+        }.getOrDefault(if (capturingNow) 1 else 0)
 
     /**
      * Delete [playlistId] from this device (playlist delete cutoff, Logan
@@ -4426,6 +4525,7 @@ class PlaylistRepository @Inject constructor(
         // none of them writes rows for this playlist after its next
         // suspension point.
         DeletedPlaylists.mark(playlistId)
+        revokeNow(playlistId)
         cancelPlaylistTasks(playlistId)
         // Sync tombstone: no older copy elsewhere brings the playlist back.
         com.aeriotv.android.core.sync.SyncStamps.removed(com.aeriotv.android.core.sync.SyncStamps.Cat.Playlists, playlistId)
@@ -4444,6 +4544,9 @@ class PlaylistRepository @Inject constructor(
         // The VOD snapshot file is keyed by the playlist's IDENTITY, which is
         // derived from the row, so compute it BEFORE the row is gone.
         val row = dao.byId(playlistId)
+        // The stored row may carry what the in-memory copy did not (the
+        // playlist's own key under a profile overlay): refuse that too.
+        revokeNow(playlistId, row)
         cutOffPlaylist(playlistId, row, keepRecordings)
         // The row goes first (Apple performServerCascadeDelete parity): the
         // Settings list observes it, so the playlist disappears at once
